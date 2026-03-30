@@ -115,7 +115,7 @@ Swanston Street stop sits one stop outside Melbourne's Free Tram Zone, right at 
 
 ## 👥 Authors
 
-**Ellitt** and **Nannan** — UniMelb students, fare evaders (reformed), game developers (aspiring).
+**Ellitt** and **Nannan** — UniMelb students.
 
 ---
 
