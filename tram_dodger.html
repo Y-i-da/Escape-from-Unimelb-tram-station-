@@ -1,0 +1,1743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Melbourne Tram Dodger v4</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0a0a18; display:flex; flex-direction:column; align-items:center;
+       justify-content:center; min-height:100vh; font-family:'Courier New',monospace;
+       user-select:none; overflow:hidden; }
+#title { color:#ffd700; font-size:18px; font-weight:bold; margin-bottom:2px;
+         letter-spacing:2px; text-shadow:0 0 12px #ffd70066; }
+#sub   { color:#ff6644; font-size:14px; margin-bottom:6px; letter-spacing:1px; }
+canvas { border:3px solid #1d7a2d; box-shadow:0 0 24px #1d7a2d55;
+         image-rendering:pixelated; display:block; max-height:82vh; width:auto; }
+#footer{ color:#446644; font-size:14px; margin-top:5px; letter-spacing:1px; }
+</style>
+</head>
+<body>
+<div id="title">🚃 TRAM DODGER — UniMelb Edition</div>
+<div id="sub">⚠ OUTSIDE FREE ZONE · Survive 30 seconds · Fine: $226 ⚠</div>
+<canvas id="c"></canvas>
+<div id="footer">WASD / Arrow Keys — Move &nbsp;|&nbsp; R — Restart &nbsp;|&nbsp; Survive 30 seconds!</div>
+<input id="chatInput" type="text" maxlength="120" placeholder="Type your excuse..."
+  style="position:absolute;display:none;bottom:160px;left:50%;transform:translateX(-50%);
+  width:340px;padding:8px 12px;font:13px monospace;background:#0a0a1a;color:#00ff88;
+  border:2px solid #00ff88;border-radius:4px;outline:none;z-index:10;" />
+<script>
+// ══════════════════════════════════════════════════
+//  SETUP
+// ══════════════════════════════════════════════════
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+const TILE = 36, COLS = 11, ROWS = 22;
+canvas.width = COLS * TILE;   // 396
+canvas.height = ROWS * TILE;  // 792
+
+// Layout
+const PLAT_W = 5;   // platform: cols 0-4
+const TRAM_L = 5;   // tram left wall col (door col)
+const TRAM_R = 8;   // tram right wall col
+const TRAM_T = 4;   // tram body starts at row 4
+const TRAM_B = 17;  // tram body ends at row 17
+
+const LEVEL_DURATION = 30;  // seconds per round
+const MAX_LEVELS     = 5;   // total rounds
+const SKILL_DUR      = 300; // disguise: 5 s at 60 fps
+const SKILL_CD       = 480; // cooldown: 8 s
+const SKILL_FLASH    = 120; // start flashing in last 2 s
+const RAGE_DUR       = 300; // due-rage: 5 s
+const RAGE_CD        = 480; // due-rage cooldown: 8 s
+
+// Tram green palette
+const TC = {
+  dark : '#0e4e1a',
+  mid  : '#1a6b2a',
+  lite : '#268838',
+  hi   : '#35aa48',
+  panel: '#0a3c14',
+  seat : '#0d7838',
+  seatH: '#14a050',
+  floor: '#6a6a6a',
+  floorD:'#5c5c5c',
+};
+
+// ══════════════════════════════════════════════════
+//  DOORS  (on col 5, rows TRAM_T..TRAM_B)
+// ══════════════════════════════════════════════════
+const DOORS = [
+  { id:1, rows:[5, 6],  halfPeriod:3000, phase:    0 },
+  { id:2, rows:[8, 9],  halfPeriod:4000, phase: 1333 },
+  { id:3, rows:[11,12], halfPeriod:1000, phase:  500 },
+  { id:4, rows:[14,15], halfPeriod:2500, phase:  875 },
+];
+function getDoor(r){ for(const d of DOORS) if(d.rows.includes(r)) return d; return null; }
+function doorOpen(d,t){ return ((t+d.phase)%(d.halfPeriod*2)) < d.halfPeriod; }
+function doorProg(d,t){ const c=(t+d.phase)%(d.halfPeriod*2);
+  return c<d.halfPeriod ? c/d.halfPeriod : (c-d.halfPeriod)/d.halfPeriod; }
+
+// ══════════════════════════════════════════════════
+//  PLATFORM FURNITURE
+// ══════════════════════════════════════════════════
+// Benches: 1×3 at col 2 (blocking)
+const BENCH_SET = new Set(['2,2','2,3','2,4','2,9','2,10','2,11','2,16','2,17','2,18']);
+// Ads: 1×1 at cols 1 & 3 (blocking)
+const AD_SET   = new Set(['1,1','3,5','1,7','3,12','1,13','3,19']);
+const AD_NAMES = ['myki','PTV','UniMelb','FINE'];
+
+function isBench(c,r){ return BENCH_SET.has(`${c},${r}`); }
+function isAd   (c,r){ return AD_SET.has(`${c},${r}`); }
+
+// ══════════════════════════════════════════════════
+//  NPC ARRAYS (declared early for walkability)
+// ══════════════════════════════════════════════════
+const platNPCs = [];  // platform pedestrians
+const tramNPCs = [];  // tram passengers (synced to doors)
+
+// ══════════════════════════════════════════════════
+//  WALKABILITY
+// ══════════════════════════════════════════════════
+const HALF = 11, PAD = 3;
+
+function isAnyNPCAt(c,r){
+  for(const n of platNPCs) if(n.col===c&&n.row===r) return true;
+  for(const n of tramNPCs) if(n.col===c&&n.row===r) return true;
+  return false;
+}
+
+function isBasicWalkable(c,r,t){
+  if(c<0||c>=COLS||r<0||r>=ROWS) return false;
+  if(c < PLAT_W){ // Platform (rows 0-21 all walkable unless furniture)
+    return !isBench(c,r) && !isAd(c,r);
+  }
+  if(c === TRAM_L){  // Door col
+    if(r<TRAM_T||r>TRAM_B) return false;
+    const d=getDoor(r); return !!d && doorOpen(d,t);
+  }
+  if(c===6||c===7) return r>=TRAM_T && r<=TRAM_B; // tram interior
+  return false; // right wall, heads, tracks
+}
+
+function checkCorners(px,py,t,blockNPC){
+  const pts=[[px-HALF+PAD,py-HALF+PAD],[px+HALF-PAD,py-HALF+PAD],
+             [px-HALF+PAD,py+HALF-PAD],[px+HALF-PAD,py+HALF-PAD]];
+  for(const[x,y] of pts){
+    const c=Math.floor(x/TILE),r=Math.floor(y/TILE);
+    if(!isBasicWalkable(c,r,t)) return false;
+    if(blockNPC && isAnyNPCAt(c,r)) return false;
+  }
+  return true;
+}
+function moveEnt(e,dx,dy,t,blockNPC){
+  if(checkCorners(e.x+dx,e.y,t,blockNPC)) e.x+=dx;
+  if(checkCorners(e.x,e.y+dy,t,blockNPC)) e.y+=dy;
+}
+
+// ══════════════════════════════════════════════════
+//  ENTITIES
+// ══════════════════════════════════════════════════
+// Player: bottom-right of tram interior
+const player = { x:7.5*TILE, y:16.5*TILE, speed:2.8, ft:0, moving:false, dir:1 };
+
+// Inspector 1 (tramIns) — top head; waits then A*-chases player into tram
+const tramIns = {
+  x: 2.5*TILE, y: 1.5*TILE,
+  phase: 'waiting', waitTimer: 100,
+  chaseSpd: 1.55, ft: 0,
+  path: [], pathTimer: 0,
+};
+
+// Inspector 2 (platIns) — bottom head; patrols platform, A*-alerts when player visible
+const platIns = {
+  x: 2.5*TILE, y: 20.5*TILE,
+  phase: 'patrol', patrolDir: -1,
+  patrolSpd: 0.45, alertSpd: 1.4,
+  alertTimer: 0, ft: 0,
+  path: [], pathTimer: 0,
+};
+
+// Disguise skill state
+const skill = { active:false, timer:0, cooldown:0, disguiseColor:'#50c878',
+                lastKnownC:0, lastKnownR:0 };
+
+// ══════════════════════════════════════════════════
+//  INIT NPCs
+// ══════════════════════════════════════════════════
+const PLAT_COLS = ['#e88060','#50c878','#9060d0','#d0a030','#50a8d8','#d06890',
+                   '#f05050','#40d0b0','#b060e0','#e0c040','#60c0f0','#e06080'];
+const TRAM_COLS = ['#f0a830','#30c8b0','#cc40c0','#40b0f0'];
+
+function initNPCs(){
+  platNPCs.length=0; tramNPCs.length=0;
+  const used=new Set();
+  // Reserve inspector positions
+  used.add(`${Math.floor(tramIns.x/TILE)},${Math.floor(tramIns.y/TILE)}`);
+  used.add(`${Math.floor(platIns.x/TILE)},${Math.floor(platIns.y/TILE)}`);
+  // Platform NPCs (base 6, scaled by level)
+  for(let i=0;i<6;i++){
+    let c,r,k,tries=0;
+    do{ c=1+Math.floor(Math.random()*4); r=1+Math.floor(Math.random()*20);
+        k=`${c},${r}`; tries++; }
+    while((used.has(k)||isBench(c,r)||isAd(c,r))&&tries<300);
+    used.add(k);
+    platNPCs.push({ col:c,row:r, moveTimer:Math.floor(Math.random()*60),
+                   movePeriod:45+Math.floor(Math.random()*55),
+                   color:PLAT_COLS[i], dir:1 });
+  }
+  // Tram passengers — one per door, movePeriod matches door halfPeriod
+  DOORS.forEach((d,i)=>{
+    const period = Math.round(d.halfPeriod/16.67);
+    const col = (i%2===0)?6:7;
+    const row = d.rows[0]+1;
+    tramNPCs.push({ col, row, moveTimer:Math.floor(Math.random()*period),
+                   movePeriod:period, color:TRAM_COLS[i], dir:1 });
+  });
+}
+
+function updatePlatNPCs(t){
+  for(let i=0;i<platNPCs.length;i++){
+    const n=platNPCs[i]; n.moveTimer++;
+    const period=n._scaledPeriod||n.movePeriod;
+    if(n.moveTimer<period) continue;
+    n.moveTimer=0;
+    const dirs=[[0,-1],[0,1],[-1,0],[1,0],[0,0],[0,0]];
+    dirs.sort(()=>Math.random()-0.5);
+    for(const[dc,dr] of dirs){
+      const nc=n.col+dc,nr=n.row+dr;
+      if(!isBasicWalkable(nc,nr,t)) continue;
+      if(isAnyNPCAt(nc,nr)) continue;
+      if(nc===Math.floor(player.x/TILE)&&nr===Math.floor(player.y/TILE)) continue;
+      if(dc!==0) n.dir=dc>0?1:-1;
+      n.col=nc; n.row=nr; break;
+    }
+  }
+}
+
+function updateTramNPCs(t){
+  for(let i=0;i<tramNPCs.length;i++){
+    const n=tramNPCs[i]; n.moveTimer++;
+    if(n.moveTimer<n.movePeriod) continue;
+    n.moveTimer=0;
+    const dirs=[[0,-1],[0,1],[-1,0],[1,0],[0,0]];
+    dirs.sort(()=>Math.random()-0.5);
+    for(const[dc,dr] of dirs){
+      const nc=n.col+dc,nr=n.row+dr;
+      // Tram passengers stay inside tram interior only
+      if((nc!==6&&nc!==7)||nr<TRAM_T||nr>TRAM_B) continue;
+      if(isAnyNPCAt(nc,nr)) continue;
+      if(nc===Math.floor(player.x/TILE)&&nr===Math.floor(player.y/TILE)) continue;
+      if(dc!==0) n.dir=dc>0?1:-1;
+      n.col=nc; n.row=nr; break;
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════
+//  INPUT
+// ══════════════════════════════════════════════════
+const keys={};
+window.addEventListener('keydown',e=>{
+  keys[e.key]=true;
+  initAudio();
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+  if((e.key==='m'||e.key==='M')) bgmMuted=!bgmMuted;
+  if((e.key==='r'||e.key==='R')&&state!=='playing'&&state!=='intro') restart();
+  if(state==='intro'&&stateTimer>100){ state='skillSelect'; stateTimer=0; }
+  if(state==='skillSelect'){
+    if(e.key==='1'){ selectedExtraSkill='myki';  pendingSkillStart=true; }
+    if(e.key==='2'){ selectedExtraSkill='rage';  pendingSkillStart=true; }
+  }
+  if(e.key===' '&&state==='playing'&&!skill.active&&skill.cooldown===0) activateSkill();
+  if((e.key==='q'||e.key==='Q')&&state==='playing'&&rageSkill.available&&!rageSkill.active&&rageSkill.cooldown===0) activateRage();
+});
+window.addEventListener('keyup',e=>{ keys[e.key]=false; });
+
+// Chat input for interrogation
+document.getElementById('chatInput').addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&state==='interrogation'&&interro.phase==='typing'){
+    const txt=e.target.value.trim();
+    if(txt.length<3) return;
+    interro.playerText=txt;
+    interro.phase='thinking';
+    interro.thinkTimer=0;
+    e.target.style.display='none';
+    submitToLLM(txt);
+  }
+});
+
+// ══════════════════════════════════════════════════
+//  GAME STATE
+// ══════════════════════════════════════════════════
+let state='intro', stateTimer=0, startMs=0, levelStartMs=0;
+let currentLevel=1, levelBanner=0;
+let selectedExtraSkill=null, pendingSkillStart=false;
+const mykiSkill  = { available:false, used:false, saveTimer:0 };
+const rageSkill  = { available:false, active:false, timer:0, cooldown:0 };
+const extraInspectors=[];
+const particles=[];
+
+// ── Audio (BGM via Web Audio API) ──
+let audioCtx=null, bgmPlaying=false, bgmMuted=false;
+const MELODY=[220,0,262,0,220,196,0,220,0,294,262,0,220,196,174,0];
+const BASS=[110,0,110,0,110,98,0,110,0,147,131,0,110,98,87,0];
+let melodyStep=0, bassStep=0;
+
+// ── Interrogation state ──
+const interro={
+  phase:'intro', // 'intro'|'typing'|'thinking'|'verdict'
+  question:'',
+  playerText:'',
+  verdict:null, // 'released'|'fined'|'arrested'
+  verdictMsg:'',
+  reason:'',
+  introTimer:80,
+  thinkDots:0,
+  thinkTimer:0,
+};
+
+// ── Audio functions ──
+function initAudio(){
+  if(audioCtx) return;
+  audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+  scheduleBGM();
+}
+
+function playNote(freq,type,duration,gain,startTime){
+  if(!audioCtx||bgmMuted||freq===0) return;
+  const osc=audioCtx.createOscillator();
+  const gainNode=audioCtx.createGain();
+  osc.connect(gainNode); gainNode.connect(audioCtx.destination);
+  osc.type=type; osc.frequency.value=freq;
+  gainNode.gain.setValueAtTime(gain,startTime);
+  gainNode.gain.exponentialRampToValueAtTime(0.001,startTime+duration*0.9);
+  osc.start(startTime); osc.stop(startTime+duration);
+}
+
+function scheduleBGM(){
+  if(!audioCtx) return;
+  const now=audioCtx.currentTime;
+  const stepDur=0.13;
+  for(let i=0;i<4;i++){
+    const t=now+i*stepDur;
+    const mi=(melodyStep+i)%MELODY.length;
+    const bi=(bassStep+i)%BASS.length;
+    if(MELODY[mi]>0) playNote(MELODY[mi],'square',stepDur*0.85,0.08,t);
+    if(BASS[bi]>0) playNote(BASS[bi],'sawtooth',stepDur*0.9,0.06,t);
+  }
+  melodyStep=(melodyStep+4)%MELODY.length;
+  bassStep=(bassStep+4)%BASS.length;
+  bgmPlaying=true;
+  setTimeout(scheduleBGM,3*stepDur*1000);
+}
+
+function spawnPart(x,y,col,n){
+  for(let i=0;i<n;i++){
+    const a=Math.random()*Math.PI*2,s=1.5+Math.random()*3.5;
+    particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-1.5,
+                    life:40+Math.random()*30,maxLife:70,col,size:3+Math.random()*4});
+  }
+}
+function tickPart(){
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i]; p.x+=p.vx; p.y+=p.vy; p.vy+=0.1; p.life--;
+    if(p.life<=0) particles.splice(i,1);
+  }
+}
+
+// ══════════════════════════════════════════════════
+//  DRAW HELPERS
+// ══════════════════════════════════════════════════
+function R(x,y,w,h,col){ ctx.fillStyle=col; ctx.fillRect(Math.round(x),Math.round(y),w,h); }
+
+function tri(x1,y1, x2,y2, x3,y3, col){
+  ctx.fillStyle=col;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.lineTo(x3,y3);
+  ctx.closePath(); ctx.fill();
+}
+
+// ══════════════════════════════════════════════════
+//  A* PATHFINDING
+// ══════════════════════════════════════════════════
+function astar(sc,sr,gc,gr,t){
+  if(sc===gc&&sr===gr) return [];
+  const key=(c,r)=>c*100+r;
+  const h=(c,r)=>Math.abs(c-gc)+Math.abs(r-gr);
+  const open=[], closed=new Set(), gMap=new Map(), par=new Map();
+  gMap.set(key(sc,sr),0);
+  open.push({c:sc,r:sr,g:0,f:h(sc,sr)});
+  const DIRS=[[0,-1],[0,1],[-1,0],[1,0]];
+  let itr=0;
+  while(open.length&&itr++<600){
+    // pick lowest-f node
+    let bi=0; for(let i=1;i<open.length;i++) if(open[i].f<open[bi].f) bi=i;
+    const cur=open.splice(bi,1)[0];
+    const ck=key(cur.c,cur.r);
+    if(cur.c===gc&&cur.r===gr){
+      // reconstruct path (waypoints after start)
+      const path=[]; let k=ck;
+      while(par.has(k)){
+        path.unshift({c:Math.floor(k/100), r:k%100});
+        k=par.get(k);
+      }
+      return path;
+    }
+    if(closed.has(ck)) continue;
+    closed.add(ck);
+    for(const[dc,dr] of DIRS){
+      const nc=cur.c+dc, nr=cur.r+dr;
+      if(!isBasicWalkable(nc,nr,t)) continue;
+      const nk=key(nc,nr);
+      if(closed.has(nk)) continue;
+      const ng=cur.g+1;
+      if(!gMap.has(nk)||ng<gMap.get(nk)){
+        gMap.set(nk,ng); par.set(nk,ck);
+        open.push({c:nc,r:nr,g:ng,f:ng+h(nc,nr)});
+      }
+    }
+  }
+  return []; // no path found (e.g. all doors closed)
+}
+
+// Move entity toward next waypoint in path (pixel-level)
+function followPath(ent,speed){
+  if(!ent.path||!ent.path.length) return;
+  const wp=ent.path[0];
+  const tx=wp.c*TILE+TILE/2, ty=wp.r*TILE+TILE/2;
+  const ddx=tx-ent.x, ddy=ty-ent.y;
+  const dist=Math.sqrt(ddx*ddx+ddy*ddy);
+  if(dist<speed+2){ ent.x=tx; ent.y=ty; ent.path.shift(); }
+  else{ ent.x+=(ddx/dist)*speed; ent.y+=(ddy/dist)*speed; }
+  ent.ft++;
+}
+
+// ══════════════════════════════════════════════════
+//  DISGUISE SKILL
+// ══════════════════════════════════════════════════
+function spawnSmoke(cx,cy){
+  for(let i=0;i<32;i++){
+    const a=Math.random()*Math.PI*2, r=Math.random()*TILE*1.3;
+    const s=0.5+Math.random()*2;
+    const g=Math.floor(155+Math.random()*90);
+    particles.push({x:cx+Math.cos(a)*r, y:cy+Math.sin(a)*r,
+      vx:Math.cos(a)*s*0.6, vy:Math.sin(a)*s*0.6-0.4,
+      life:40+Math.random()*35, maxLife:75,
+      col:`rgba(${g},${g},${g},0.88)`, size:9+Math.random()*14 });
+  }
+}
+function activateSkill(){
+  skill.active=true; skill.timer=SKILL_DUR; skill.cooldown=0;
+  skill.disguiseColor=PLAT_COLS[Math.floor(Math.random()*PLAT_COLS.length)];
+  // Remember where player hid — inspectors will search this tile
+  skill.lastKnownC=Math.floor(player.x/TILE);
+  skill.lastKnownR=Math.floor(player.y/TILE);
+  spawnSmoke(player.x, player.y);
+}
+function deactivateSkill(){
+  skill.active=false; skill.timer=0; skill.cooldown=SKILL_CD;
+  spawnPart(player.x, player.y, '#ffffffcc', 10);
+}
+function activateRage(){
+  rageSkill.active=true; rageSkill.timer=RAGE_DUR; rageSkill.cooldown=0;
+  spawnPart(player.x,player.y,'#ff6600',14);
+  spawnPart(player.x,player.y,'#ff2200',8);
+}
+function deactivateRage(){
+  rageSkill.active=false; rageSkill.timer=0; rageSkill.cooldown=RAGE_CD;
+}
+// Absorb a catch with myki card, or trigger game-over
+function catchPlayer(){
+  if(skill.active) deactivateSkill();
+  if(mykiSkill.available&&!mykiSkill.used){
+    mykiSkill.used=true; mykiSkill.saveTimer=150;
+    spawnPart(player.x,player.y,'#00ff44',22);
+    spawnPart(player.x,player.y,'#ffd700',12);
+    // Reset all inspector paths to give player breathing room
+    tramIns.path=[]; tramIns.pathTimer=20;
+    platIns.path=[]; platIns.pathTimer=20;
+    for(const ei of extraInspectors){ ei.path=[]; ei.pathTimer=20; }
+  } else {
+    startInterrogation();
+  }
+}
+
+function startInterrogation(){
+  if(skill.active) deactivateSkill();
+  const questions=[
+    "Your myki tap-on record shows: NOTHING. Explain yourself, immediately!",
+    "This stop is OUTSIDE the Free Zone. I need to see a valid ticket RIGHT NOW.",
+    "You've been running around this station. Where is your valid myki?",
+  ];
+  interro.phase='intro';
+  interro.question=questions[Math.floor(Math.random()*questions.length)];
+  interro.playerText='';
+  interro.verdict=null;
+  interro.verdictMsg='';
+  interro.reason='';
+  interro.introTimer=90;
+  state='interrogation';
+  setTimeout(()=>{
+    const inp=document.getElementById('chatInput');
+    if(inp){ inp.style.display='block'; inp.value=''; inp.focus(); }
+    interro.phase='typing';
+  },1500);
+}
+
+async function submitToLLM(playerText){
+  try{
+    const resp=await fetch('/api/interrogate',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({playerResponse:playerText,round:currentLevel})
+    });
+    const data=await resp.json();
+    interro.verdict=data.verdict||'fined';
+    interro.verdictMsg=data.message||"Fine issued.";
+    interro.reason=data.reason||"";
+    interro.phase='verdict';
+    setTimeout(()=>{
+      if(interro.verdict==='released'){
+        state='playing';
+        levelStartMs=performance.now()-(LEVEL_DURATION-8)*1000;
+        spawnPart(player.x,player.y,'#00ff88',20);
+      } else {
+        state='caught';
+      }
+    },4000);
+  } catch(err){
+    interro.verdict='fined';
+    interro.verdictMsg="I've heard every excuse. Fine issued. $226.";
+    interro.reason='No valid ticket detected';
+    interro.phase='verdict';
+    setTimeout(()=>{ state='caught'; },3000);
+  }
+}
+
+// Spawn an additional inspector at start of each new level (levels 2-4)
+function spawnExtraInspector(){
+  const idx=extraInspectors.length; // 0=level2, 1=level3, 2=level4
+  const spawns=[
+    {x:0.5*TILE, y:3.5*TILE},   // top-left of platform
+    {x:4.5*TILE, y:18.5*TILE},  // bottom-right corner
+    {x:0.5*TILE, y:10.5*TILE},  // mid-left
+  ];
+  const sp=spawns[idx]||{x:1.5*TILE, y:5.5*TILE};
+  extraInspectors.push({
+    x:sp.x, y:sp.y,
+    chaseSpd:1.25+idx*0.12,
+    ft:0, path:[], pathTimer:0,
+  });
+  spawnPart(sp.x,sp.y,'#ff4444',14);
+  spawnSmoke(sp.x,sp.y);
+}
+
+// Spawn 2 new NPCs at start of a new level (with smoke effect)
+function spawnNewLevelNPCs(){
+  const used=new Set();
+  for(const n of platNPCs) used.add(`${n.col},${n.row}`);
+  for(let count=0;count<2;count++){
+    let c,r,k,tries=0;
+    do{ c=1+Math.floor(Math.random()*4); r=1+Math.floor(Math.random()*20);
+        k=`${c},${r}`; tries++; }
+    while((used.has(k)||isBench(c,r)||isAd(c,r))&&tries<300);
+    used.add(k);
+    const idx=platNPCs.length;
+    platNPCs.push({ col:c, row:r, moveTimer:0,
+                    movePeriod:45+Math.floor(Math.random()*55),
+                    color:PLAT_COLS[idx%PLAT_COLS.length], dir:1 });
+    spawnSmoke(c*TILE+TILE/2, r*TILE+TILE/2);
+    spawnPart(c*TILE+TILE/2, r*TILE+TILE/2, '#88ffcc', 8);
+  }
+}
+
+// ══════════════════════════════════════════════════
+//  SKILL SELECT SCREEN
+// ══════════════════════════════════════════════════
+function drawSkillSelect(){
+  const W=canvas.width, H=canvas.height;
+  R(0,0,W,H,'rgba(0,0,8,0.94)');
+  // Scanlines
+  for(let y=0;y<H;y+=4){ ctx.fillStyle='rgba(0,0,0,0.18)'; ctx.fillRect(0,y,W,2); }
+
+  ctx.fillStyle='#ffd700'; ctx.font='bold 18px monospace'; ctx.textAlign='center';
+  ctx.shadowColor='#ffaa00'; ctx.shadowBlur=10;
+  ctx.fillText(`ROUND ${currentLevel} — CHOOSE YOUR SKILL`, W/2, 40);
+  ctx.shadowBlur=0;
+  ctx.fillStyle='#aaaacc'; ctx.font='12px monospace';
+  ctx.fillText('Pick one extra skill for this round', W/2, 56);
+
+  // Skill 1 — Myki Card [press 1]
+  const card1x=(W/2)-140, cardy=78, cardW=120, cardH=180;
+  R(card1x,cardy,cardW,cardH,'#0a1a0a');
+  ctx.strokeStyle='#00ff88'; ctx.lineWidth=2; ctx.strokeRect(card1x,cardy,cardW,cardH);
+  ctx.fillStyle='#00ff88'; ctx.font='bold 13px monospace'; ctx.textAlign='center';
+  ctx.fillText('[1]  MYKI CARD', card1x+cardW/2, cardy+18);
+  ctx.strokeStyle='#00ff8844'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(card1x+8,cardy+26); ctx.lineTo(card1x+cardW-8,cardy+26); ctx.stroke();
+  // Icon — draw card
+  const cx1=card1x+cardW/2, cy1=cardy+65;
+  R(cx1-22,cy1-14,44,28,'#1a4a1a'); R(cx1-20,cy1-12,40,24,'#22aa44');
+  ctx.fillStyle='#ffe800'; ctx.font='bold 11px monospace'; ctx.textAlign='center';
+  ctx.fillText('myki', cx1, cy1+4);
+  ctx.strokeStyle='#88ff88'; ctx.lineWidth=1; ctx.strokeRect(cx1-22,cy1-14,44,28);
+  // Star (免死金牌)
+  ctx.fillStyle='#ffd700'; ctx.font='18px monospace'; ctx.textAlign='center';
+  ctx.fillText('⭐', cx1, cy1+36);
+  // Description
+  const desc1=['One-time catch', 'absorber.','','If caught once,','inspector loses','you instantly!'];
+  desc1.forEach((ln,i)=>{
+    ctx.fillStyle=i<2?'#ccffcc':'#99bb99';
+    ctx.font=i<2?'bold 12px monospace':'11px monospace';
+    ctx.textAlign='center';
+    ctx.fillText(ln, card1x+cardW/2, cardy+115+i*13);
+  });
+
+  // Skill 2 — Due Deadline Rage [press 2]
+  const card2x=(W/2)+20;
+  R(card2x,cardy,cardW,cardH,'#1a0808');
+  ctx.strokeStyle='#ff6600'; ctx.lineWidth=2; ctx.strokeRect(card2x,cardy,cardW,cardH);
+  ctx.fillStyle='#ff6600'; ctx.font='bold 13px monospace'; ctx.textAlign='center';
+  ctx.fillText('[2]  DUE RAGE', card2x+cardW/2, cardy+18);
+  ctx.strokeStyle='#ff660044'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(card2x+8,cardy+26); ctx.lineTo(card2x+cardW-8,cardy+26); ctx.stroke();
+  // Icon — fire
+  const cx2=card2x+cardW/2, cy2=cardy+65;
+  ctx.fillStyle='#ff4400'; ctx.font='26px monospace'; ctx.textAlign='center';
+  ctx.fillText('🔥', cx2, cy2+10);
+  ctx.fillStyle='#ff8844'; ctx.font='bold 8px monospace';
+  ctx.fillText('[Q]', cx2, cy2+32);
+  // Description
+  const desc2=['Push all NPCs', 'out of the way!','','5 sec rage mode.','Cannot push','inspectors.'];
+  desc2.forEach((ln,i)=>{
+    ctx.fillStyle=i<2?'#ffccaa':'#cc9977';
+    ctx.font=i<2?'bold 12px monospace':'11px monospace';
+    ctx.textAlign='center';
+    ctx.fillText(ln, card2x+cardW/2, cardy+115+i*13);
+  });
+
+  // Baseline reminder
+  R(W/2-100,cardy+cardH+14,200,38,'rgba(0,20,30,0.85)');
+  ctx.strokeStyle='#00ddff44'; ctx.lineWidth=1; ctx.strokeRect(W/2-100,cardy+cardH+14,200,38);
+  ctx.fillStyle='#00ddff'; ctx.font='bold 12px monospace'; ctx.textAlign='center';
+  ctx.fillText('SKILL 1 (always free): [SPACE]', W/2, cardy+cardH+30);
+  ctx.fillStyle='#88ccdd'; ctx.font='11px monospace';
+  ctx.fillText('Disguise yourself as an NPC for 5s', W/2, cardy+cardH+44);
+
+  // Blinking prompt
+  const blink=Math.floor(Date.now()/380)%2;
+  if(blink){
+    ctx.fillStyle='#ffff88'; ctx.font='bold 12px monospace'; ctx.textAlign='center';
+    ctx.fillText('Press  1  or  2  to choose', W/2, H-18);
+  }
+
+  // ── CONTROLS GUIDE ──
+  const ctrlY = H - 65;
+  R(0, ctrlY, W, 65, 'rgba(0,0,0,0.7)');
+  ctx.strokeStyle='#666666'; ctx.lineWidth=1; ctx.strokeRect(0, ctrlY, W, 65);
+  ctx.fillStyle='#888888'; ctx.font='10px monospace'; ctx.textAlign='center';
+  ctx.fillText('─── CONTROLS ───────────────────────────────────────────', W/2, ctrlY+16);
+  ctx.fillStyle='#ffff00'; ctx.font='bold 11px monospace'; ctx.textAlign='center';
+  ctx.fillText('↑↓←→ / WASD', W/2-180, ctrlY+35);
+  ctx.fillStyle='#88ccff'; ctx.font='11px monospace';
+  ctx.fillText('Move', W/2-100, ctrlY+35);
+  ctx.fillStyle='#ffff00'; ctx.font='bold 11px monospace';
+  ctx.fillText('SPACE', W/2-20, ctrlY+35);
+  ctx.fillStyle='#88ccff'; ctx.font='11px monospace';
+  ctx.fillText('Disguise (5s)', W/2+50, ctrlY+35);
+  ctx.fillStyle='#ffff00'; ctx.font='bold 11px monospace';
+  ctx.fillText('Q', W/2+180, ctrlY+35);
+  ctx.fillStyle='#88ccff'; ctx.font='11px monospace';
+  ctx.fillText('Rage (if selected)', W/2+210, ctrlY+35);
+}
+
+// ── Text wrapping helper ──
+function wrapText(ctx,text,x,y,maxWidth,lineHeight){
+  const words=text.split(' ');
+  let line='';
+  for(const word of words){
+    const test=line+word+' ';
+    if(ctx.measureText(test).width>maxWidth&&line){
+      ctx.fillText(line.trim(),x,y);
+      line=word+' ';
+      y+=lineHeight;
+    } else { line=test; }
+  }
+  if(line) ctx.fillText(line.trim(),x,y);
+}
+
+// ── Interrogation screen ──
+function drawInterrogation(){
+  const W=canvas.width, H=canvas.height;
+  // Darken game behind
+  ctx.fillStyle='rgba(0,0,20,0.85)';
+  ctx.fillRect(0,0,W,H);
+
+  // Inspector avatar (big, centered top)
+  const ipy=H*0.18;
+  drawInspector(W/2,ipy,interro.introTimer,interro.phase==='intro'?120:0);
+
+  // Title bar
+  R(0,H*0.26,W,28,'#1a0808');
+  ctx.strokeStyle='#ff4444'; ctx.lineWidth=2;
+  ctx.strokeRect(0,H*0.26,W,28);
+  ctx.fillStyle='#ff4444'; ctx.font='bold 14px monospace'; ctx.textAlign='center';
+  ctx.fillText('🚨  TICKET INSPECTION  🚨',W/2,H*0.26+19);
+
+  // Inspector question bubble
+  const qy=H*0.36;
+  R(16,qy,W-32,58,'#0d0520');
+  ctx.strokeStyle='#cc44ff'; ctx.lineWidth=1.5; ctx.strokeRect(16,qy,W-32,58);
+  ctx.fillStyle='#cc44ff'; ctx.font='bold 10px monospace'; ctx.textAlign='left';
+  ctx.fillText('INSPECTOR:',24,qy+16);
+  // Word-wrap the question
+  ctx.fillStyle='#ffffff'; ctx.font='11px monospace';
+  wrapText(ctx,interro.question,24,qy+32,W-48,14);
+
+  if(interro.phase==='intro'){
+    // Intro animation — nothing more needed
+  } else if(interro.phase==='typing'){
+    // Prompt label above input
+    ctx.fillStyle='#00ff88'; ctx.font='bold 12px monospace'; ctx.textAlign='center';
+    ctx.fillText('Your response (type below, press Enter):',W/2,H*0.62);
+    ctx.fillStyle='#88aacc'; ctx.font='11px monospace';
+    ctx.fillText('Be convincing! The inspector decides your fate...',W/2,H*0.67);
+  } else if(interro.phase==='thinking'){
+    // Show player's answer
+    R(16,H*0.60,W-32,44,'#0a1a0a');
+    ctx.strokeStyle='#00ff88'; ctx.lineWidth=1; ctx.strokeRect(16,H*0.60,W-32,44);
+    ctx.fillStyle='#00ff88'; ctx.font='bold 10px monospace'; ctx.textAlign='left';
+    ctx.fillText('YOU:',24,H*0.60+16);
+    ctx.fillStyle='#ccffcc'; ctx.font='11px monospace';
+    wrapText(ctx,interro.playerText,24,H*0.60+30,W-48,13);
+
+    // Thinking dots
+    interro.thinkTimer++;
+    interro.thinkDots=Math.floor(interro.thinkTimer/15)%4;
+    const dots='.'.repeat(interro.thinkDots);
+    ctx.fillStyle='#ffcc00'; ctx.font='bold 13px monospace'; ctx.textAlign='center';
+    ctx.fillText(`Inspector is considering${dots}`,W/2,H*0.80);
+  } else if(interro.phase==='verdict'){
+    // Show player answer
+    R(16,H*0.58,W-32,44,'#0a1a0a');
+    ctx.strokeStyle='#00ff88'; ctx.lineWidth=1; ctx.strokeRect(16,H*0.58,W-32,44);
+    ctx.fillStyle='#00ff88'; ctx.font='bold 10px monospace'; ctx.textAlign='left';
+    ctx.fillText('YOU:',24,H*0.58+16);
+    ctx.fillStyle='#ccffcc'; ctx.font='11px monospace';
+    wrapText(ctx,interro.playerText,24,H*0.58+30,W-48,13);
+
+    // Verdict banner
+    const vCol=interro.verdict==='released'?'#00ff88':interro.verdict==='fined'?'#ffaa00':'#ff3333';
+    const vText=interro.verdict==='released'?'✅  LET GO!':interro.verdict==='fined'?'💸  $226 FINE':'🚔  ARRESTED!';
+    R(16,H*0.76,W-32,32,'rgba(0,0,0,0.8)');
+    ctx.strokeStyle=vCol; ctx.lineWidth=2; ctx.strokeRect(16,H*0.76,W-32,32);
+    ctx.fillStyle=vCol; ctx.font='bold 16px monospace'; ctx.textAlign='center';
+    ctx.fillText(vText,W/2,H*0.76+22);
+
+    // Inspector message
+    R(16,H*0.82,W-32,50,'#050520');
+    ctx.strokeStyle='#cc44ff88'; ctx.lineWidth=1; ctx.strokeRect(16,H*0.82,W-32,50);
+    ctx.fillStyle='#cc44ff'; ctx.font='bold 10px monospace'; ctx.textAlign='left';
+    ctx.fillText('INSPECTOR:',24,H*0.82+14);
+    ctx.fillStyle='#ddaaff'; ctx.font='11px monospace';
+    wrapText(ctx,interro.verdictMsg,24,H*0.82+28,W-48,13);
+  }
+}
+
+// Draw player disguised as a plain NPC (uses pixel coords)
+function drawNPCAt(px,py,color){
+  const x=Math.round(px-TILE/2), y=Math.round(py-TILE/2), S=TILE;
+  ctx.fillStyle='rgba(0,0,0,0.18)'; ctx.beginPath();
+  ctx.ellipse(px,py+S*0.42,S*0.2,S*0.07,0,0,Math.PI*2); ctx.fill();
+  R(x+S*0.22,y+S*0.36,S*0.56,S*0.28,color);
+  R(x+S*0.22,y+S*0.36,S*0.56,3,'rgba(255,255,255,0.2)');
+  R(x+S*0.28,y+S*0.12,S*0.44,S*0.24,'#f0c080');
+  R(x+S*0.28,y+S*0.12,S*0.44,3,'#c09060');
+  R(x+S*0.28,y+S*0.62,4,7,'#555'); R(x+S*0.52,y+S*0.62,4,7,'#555');
+  R(x+S*0.26,y+S*0.62+6,6,3,'#333'); R(x+S*0.50,y+S*0.62+6,6,3,'#333');
+}
+
+// ══════════════════════════════════════════════════
+//  INTRO CUTSCENE
+// ══════════════════════════════════════════════════
+function drawIntroCutscene(frame){
+  const W=canvas.width, H=canvas.height;
+
+  // ── Dark background ──
+  R(0,0,W,H,'#050510');
+
+  // ── Twinkling stars ──
+  for(let i=0;i<55;i++){
+    const sx=(i*137+i*i*31)%W, sy=(i*89+i*51)%(H*0.45);
+    const blink=Math.sin(frame*0.07+i*1.7)>0.4;
+    if(blink) R(sx,sy,2,2,'#ffffffcc');
+  }
+
+  // ── City silhouette ──
+  const bld=[[0,55,38,85],[38,35,30,75],[68,22,50,88],[118,45,32,65],
+             [150,14,44,86],[194,38,30,62],[224,50,40,70],[264,25,35,85],
+             [299,40,30,60],[329,10,50,90],[379,44,17,56]];
+  for(const[bx,btop,bw,bh] of bld){
+    R(bx,H*0.42-bh,bw,bh,'#0d0d22');
+    for(let wy=H*0.42-bh+5;wy<H*0.42-4;wy+=10){
+      for(let wx=bx+3;wx<bx+bw-3;wx+=7){
+        if((wx*7+wy*13+bx)%5>1) R(wx,wy,3,5,'rgba(255,230,80,0.25)');
+      }
+    }
+  }
+
+  // ── Platform strip at bottom ──
+  const platY=H*0.72, platH=36;
+  R(0,platY,W,platH,'#8a7e70');
+  R(0,platY,W,3,'#aaa'); R(0,platY+platH-2,W,2,'#666');
+  for(let px=0;px<W;px+=36){
+    ctx.strokeStyle='#7a7060'; ctx.lineWidth=0.5;
+    ctx.strokeRect(px,platY,36,platH);
+  }
+
+  // ── Tram on left — inspector pours out ──
+  const tW=88, tH=TILE*3.2, tX=0, tY=platY-tH+platH;
+  R(tX,tY,tW,tH,'#1a6b2a');
+  R(tX+4,tY+6,tW-8,TILE,'#1a3a6a');
+  R(tX+7,tY+9,tW-14,TILE-6,'#2060b0');
+  R(tX+12,tY+12,16,7,'#ffffff22');
+  R(tX,platY,tW,4,TC.panel);
+  // Tram door
+  const dOpen=frame>=30;
+  R(tX+18,platY-2,30,platH+2,dOpen?'#001a08':'#1a0f00');
+  R(tX+14,platY-2,4,platH+2,TC.panel); R(tX+48,platY-2,4,platH+2,TC.panel);
+
+  // ── Escape animation ──
+  // Inspector chases student right across platform
+  const runY=platY+platH*0.3;
+
+  // Inspector emerges from tram at frame 30, chases right
+  if(frame>=30){
+    const iProg=Math.min(1,(frame-30)/30);
+    const iBaseX=tX+tW+iProg*(frame<120?frame*1.4:168);
+    const iChase=frame>=80?Math.min(W+TILE,(frame-80)*2.8):0;
+    const iX=Math.min(iBaseX+iChase, W+TILE);
+    if(iX<W+TILE) drawInspector(iX, runY, frame, frame>50?120:0);
+  }
+
+  // Second inspector (frame 55)
+  if(frame>=55){
+    const i2X=tX+tW+Math.min(W,(frame-55)*2.1);
+    if(i2X<W+TILE) drawInspector(i2X-30, runY+8, frame, frame>70?90:0);
+  }
+
+  // Student runs right ahead of inspectors (frame 20+)
+  if(frame>=20){
+    const sX=Math.min(W+TILE, (frame-20)*3.6+tW+40);
+    if(sX<W+TILE) drawStudent(sX, runY-4, 1, frame, true);
+  }
+
+  // ── BIG TITLE (slides in from left, frame 0-60) ──
+  ctx.save();
+  // "ESCAPE FROM" — slides in from left
+  const t1x=W/2 - (1-Math.min(1,frame/30))*W*0.8;
+  ctx.globalAlpha=Math.min(1,frame/20);
+  ctx.fillStyle='#ff4444';
+  ctx.font='bold 22px monospace';
+  ctx.textAlign='center';
+  ctx.shadowColor='#ff0000'; ctx.shadowBlur=12;
+  ctx.fillText('ESCAPE FROM', W/2 - (1-Math.min(1,frame/25))*W, H*0.10+2);
+  ctx.shadowBlur=0;
+  ctx.globalAlpha=1;
+
+  // "UNIMELB" — big blue glow, slides from right (frame 15+)
+  if(frame>=15){
+    const ux=W/2 + (1-Math.min(1,(frame-15)/30))*W;
+    ctx.globalAlpha=Math.min(1,(frame-15)/20);
+    ctx.fillStyle='#00ccff';
+    ctx.font='bold 38px monospace';
+    ctx.shadowColor='#0088ff'; ctx.shadowBlur=20;
+    ctx.fillText('UNIMELB', ux, H*0.18);
+    ctx.shadowBlur=0;
+    ctx.globalAlpha=1;
+  }
+
+  // "TRAM STATION" — slides from left (frame 30+)
+  if(frame>=30){
+    const tx2=W/2 - (1-Math.min(1,(frame-30)/30))*W;
+    ctx.globalAlpha=Math.min(1,(frame-30)/20);
+    ctx.fillStyle='#ffd700';
+    ctx.font='bold 26px monospace';
+    ctx.shadowColor='#ffaa00'; ctx.shadowBlur=14;
+    ctx.fillText('TRAM STATION', tx2, H*0.26);
+    ctx.shadowBlur=0;
+    ctx.globalAlpha=1;
+  }
+  ctx.restore();
+
+  // ── Divider line (frame 50+) ──
+  if(frame>=50){
+    const la=Math.min(1,(frame-50)/20);
+    ctx.globalAlpha=la*0.7;
+    ctx.strokeStyle='#ffd700'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(W*0.1,H*0.30); ctx.lineTo(W*0.9,H*0.30); ctx.stroke();
+    ctx.globalAlpha=1;
+  }
+
+  // ── Story text (frame 60+, fades in line by line) ──
+  const story=[
+    "Melbourne's tram stop outside the Free Zone.",
+    "Swanston St — UniMelb's most ticketed stop.",
+    "Inspectors swarm every arriving tram.",
+    "You're broke. You're late. You have no Myki.",
+    "SURVIVE. DODGE. ESCAPE.",
+  ];
+  story.forEach((line,i)=>{
+    const sf=70+i*18;
+    if(frame<sf) return;
+    const sa=Math.min(1,(frame-sf)/15);
+    ctx.globalAlpha=sa;
+    ctx.fillStyle=i===4?'#ff6644':'#c8d8e8';
+    ctx.font=i===4?'bold 14px monospace':'13px monospace';
+    ctx.textAlign='center';
+    ctx.fillText(line, W/2, H*0.345+i*14);
+    ctx.globalAlpha=1;
+  });
+
+  // ── Author credit (frame 165+) ──
+  if(frame>=165){
+    const aa=Math.min(1,(frame-165)/25);
+    ctx.globalAlpha=aa*0.85;
+    ctx.fillStyle='#8899bb';
+    ctx.font='italic 12px monospace';
+    ctx.textAlign='center';
+    ctx.fillText('— By Ellitt and Nannan —', W/2, H*0.43);
+    ctx.globalAlpha=1;
+  }
+
+  // ── Controls panel (frame 195+) ──
+  if(frame>=195){
+    const pa=Math.min(1,(frame-195)/40);
+    ctx.globalAlpha=pa;
+    const pw=300,ph=180,px2=(W-pw)/2,py2=H*0.47;
+    R(px2,py2,pw,ph,'rgba(0,4,18,0.93)');
+    ctx.strokeStyle='#00ff88'; ctx.lineWidth=2; ctx.strokeRect(px2,py2,pw,ph);
+    ctx.fillStyle='#00ff88'; ctx.font='bold 15px monospace'; ctx.textAlign='center';
+    ctx.fillText('CONTROLS', W/2, py2+18);
+    ctx.strokeStyle='#00ff8855'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(px2+10,py2+26); ctx.lineTo(px2+pw-10,py2+26); ctx.stroke();
+
+    const tips=[
+      ['#ffd700','ARROWS/WASD','Move'],
+      ['#00ddff','SPACE','Disguise (5s) — always available'],
+      ['#ff88cc','1 / 2','Choose extra skill before each round'],
+      ['#ff8844','','5 rounds × 30 sec — survive them all!'],
+    ];
+    tips.forEach(([col,key,desc],i)=>{
+      if(frame<215+i*20) return;
+      const ly=py2+46+i*32;
+      if(key){
+        R(px2+10,ly-12,60,16,'#0a1a0a');
+        ctx.fillStyle='#ffe800'; ctx.font='bold 12px monospace'; ctx.textAlign='left';
+        ctx.fillText(key,px2+14,ly);
+      }
+      ctx.fillStyle=col; ctx.font='12px monospace'; ctx.textAlign='left';
+      ctx.fillText(desc,px2+(key?76:14),ly);
+    });
+    ctx.globalAlpha=1;
+  }
+
+  // ── "Press any key" prompt (frame 340+) ──
+  if(frame>=340){
+    const blink=Math.floor(frame/20)%2;
+    if(blink){
+      ctx.fillStyle='#00ff88'; ctx.font='bold 13px monospace'; ctx.textAlign='center';
+      ctx.fillText('▶  Press any key to continue  ◀', W/2, H*0.955);
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════
+//  MAP DRAWING
+// ══════════════════════════════════════════════════
+function drawMap(t){
+  const benchToDraw = [];   // collected during loop, drawn after so they sit on top
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      const x=c*TILE, y=r*TILE;
+
+      // ── Background tracks (cols 9-10) ───────────
+      if(c>=9){
+        R(x,y,TILE,TILE,'#191919');
+        R(x+7,y,3,TILE,'#333'); R(x+TILE-10,y,3,TILE,'#333');
+        if(r%2===0) R(x,y+TILE/2-2,TILE,4,'#221e10');
+        continue;
+      }
+
+      // ── Tram head top (cols 5-8, rows 0-3) ──────
+      if(c>=TRAM_L&&c<=TRAM_R&&r<TRAM_T){ drawHeadTile(x,y,c,r,true); continue; }
+
+      // ── Tram head bottom (cols 5-8, rows 18-21) ─
+      if(c>=TRAM_L&&c<=TRAM_R&&r>TRAM_B){ drawHeadTile(x,y,c,r,false); continue; }
+
+      // ── Tram body (cols 5-8, rows 4-17) ─────────
+      if(c>=TRAM_L&&c<=TRAM_R){
+        if(c===TRAM_R){
+          // Right wall
+          R(x,y,TILE,TILE,TC.mid);
+          R(x,y,3,TILE,TC.panel); R(x+TILE-3,y,3,TILE,TC.panel);
+          R(x+TILE/2-1,y+3,2,TILE-6,TC.hi);
+        } else if(c===TRAM_L){
+          const door=getDoor(r);
+          if(door){ drawDoor(x,y,door,r,t); }
+          else {
+            R(x,y,TILE,TILE,TC.mid);
+            R(x,y,3,TILE,TC.panel); R(x+3,y,TILE-3,TILE,TC.dark);
+            R(x+TILE/2-1,y+3,2,TILE-6,TC.hi);
+          }
+          // Timer bar on platform side
+          if(door){
+            const prog=doorProg(door,t), open=doorOpen(door,t);
+            const bH=TILE-6, fH=Math.round(prog*bH);
+            R(x-5,y+3,4,bH,'#111');
+            R(x-5,y+3+bH-fH,4,fH,open?'#ff8800':'#00cc55');
+            if(r===door.rows[0]){
+              ctx.fillStyle='#ffcc0099'; ctx.font='6px monospace'; ctx.textAlign='center';
+              ctx.fillText(`D${door.id}`,x-10,y+8);
+            }
+          }
+        } else {
+          // Tram interior floor (gray)
+          const shade=(c+r)%2===0?TC.floor:TC.floorD;
+          R(x,y,TILE,TILE,shade);
+          ctx.strokeStyle='#555'; ctx.lineWidth=0.5; ctx.strokeRect(x+.5,y+.5,TILE-1,TILE-1);
+          // Green seats (every 3rd row, both interior cols)
+          if(r%3===1){
+            R(x+3,y+3,TILE-6,TILE-6,TC.seat);
+            R(x+4,y+4,TILE-8,7,TC.seatH);
+            R(x+3,y+TILE-9,TILE-6,6,TC.dark);
+            R(x+5,y+5,3,3,'#888820'); R(x+TILE-8,y+5,3,3,'#888820');
+          }
+          // Handrail poles (every 4th row)
+          if(r%4===3){
+            R(x+TILE/2-4,y,8,TILE,'#b09020');
+            R(x+TILE/2-3,y,5,TILE,'#d0b030');
+            R(x+TILE/2-2,y+2,2,TILE-4,'#f0d060');
+          }
+        }
+        continue;
+      }
+
+      // ── Platform (cols 0-4) ──────────────────────
+      if(isBench(c,r)){
+        R(x,y,TILE,TILE,'#b0a898');
+        if(!isBench(c,r-1)) benchToDraw.push({x,y}); // schedule bench draw after loop
+        continue;
+      }
+      if(isAd(c,r)){ R(x,y,TILE,TILE,'#b0a898'); drawAd(x,y,t); continue; }
+
+      // Platform floor
+      const shade=(c+r)%2===0?'#b0a898':'#a89e90';
+      R(x,y,TILE,TILE,shade);
+      ctx.strokeStyle='#958c80'; ctx.lineWidth=0.5; ctx.strokeRect(x+.5,y+.5,TILE-1,TILE-1);
+      // Yellow edge line at platform border (col 4)
+      if(c===4) R(x+TILE-3,y,3,TILE,'#ffff0055');
+      // Top/bottom platform edge (rows 0, 21)
+      if(r===0) R(x,y,TILE,4,'#888');
+      if(r===ROWS-1) R(x,y+TILE-4,TILE,4,'#888');
+    }
+  }
+
+  // Draw benches on top of floor tiles (z-order fix)
+  for(const b of benchToDraw) drawBench3(b.x, b.y);
+
+  // Zone labels
+  R(TILE*0.3,3,TILE*2.8,13,'#003d7ccc');
+  ctx.fillStyle='#ffd700'; ctx.font='bold 8px monospace'; ctx.textAlign='center';
+  ctx.fillText('PLATFORM',TILE*1.7,13);
+  R(TILE*0.3,18,TILE*2.8,11,'#cc3333aa');
+  ctx.fillStyle='#fff'; ctx.font='6px monospace'; ctx.textAlign='center';
+  ctx.fillText('OUTSIDE FREE ZONE',TILE*1.7,26);
+}
+
+// ── Tram head tile ───────────────────────────────
+function drawHeadTile(x,y,c,r,isTop){
+  // tipDist: 0=outermost tip, 3=closest to tram body
+  const tipDist = isTop ? r : (ROWS-1-r);
+  const isLeft  = c===TRAM_L;
+  const isRight = c===TRAM_R;
+  const isMid   = !isLeft && !isRight;
+
+  // Background (track)
+  R(x,y,TILE,TILE,'#191919');
+  R(x+7,y,3,TILE,'#333'); R(x+TILE-10,y,3,TILE,'#333');
+  if(r%2===0) R(x,y+TILE/2-2,TILE,4,'#221e10');
+
+  if(tipDist===0){
+    // ── Outermost row: triangular corners, windshield middle ──
+    if(isLeft){
+      // Top-left corner cut: keep bottom-right triangle
+      tri(x, y+TILE,  x+TILE, y+TILE,  x+TILE, y,  TC.mid);
+      // Headlight / tail light on inner edge
+      const lc = isTop?'#ffffa0':'#cc1100';
+      tri(x+TILE-14,y+(isTop?TILE-14:2), x+TILE,y+(isTop?TILE-14:2), x+TILE,y+(isTop?TILE:16), lc);
+    } else if(isRight){
+      // Top-right corner cut: keep bottom-left triangle
+      tri(x, y,  x, y+TILE,  x+TILE, y+TILE,  TC.mid);
+      const lc = isTop?'#ffffa0':'#cc1100';
+      tri(x,y+(isTop?TILE-14:2), x+14,y+(isTop?TILE-14:2), x,y+(isTop?TILE:16), lc);
+    } else {
+      // Middle cols: windshield
+      R(x,y,TILE,TILE,TC.mid);
+      R(x+2,y+(isTop?4:2),TILE-4,TILE-8,'#1a3a6a');
+      R(x+4,y+(isTop?6:4),TILE-8,TILE-12,'#2060b0');
+      // Glass reflection
+      R(x+6,y+(isTop?8:6),10,4,'#ffffff44');
+    }
+    // Panel seam
+    ctx.strokeStyle=TC.panel; ctx.lineWidth=0.5; ctx.strokeRect(x+.5,y+.5,TILE-1,TILE-1);
+
+  } else if(tipDist===1){
+    // ── Light row ──
+    R(x,y,TILE,TILE,TC.mid);
+    if(isLeft||isRight){
+      R(isLeft?x:x, y, 3, TILE, TC.panel);
+      R(isRight?x+TILE-3:x+TILE-3, y, 3, TILE, TC.panel);
+      // Lights
+      const lc = isTop?'#ffffa0':'#dd1100';
+      const lx = isLeft ? x+TILE-14 : x+2;
+      R(lx,y+TILE/2-6,12,10,lc);
+      R(lx+2,y+TILE/2-4,8,6,isTop?'#fff':'#ff4400');
+    } else {
+      // Windshield continuation
+      R(x+2,y,TILE-4,TILE-4,'#1a3a6a');
+      R(x+4,y+2,TILE-8,TILE-8,'#2060b0');
+      // Wiper mark
+      if(c===6){ ctx.strokeStyle='#ffffff44'; ctx.lineWidth=1.5;
+        ctx.beginPath(); ctx.moveTo(x+4,isTop?y+TILE-4:y+4);
+        ctx.lineTo(x+TILE-4,isTop?y+4:y+TILE-4); ctx.stroke(); }
+    }
+    ctx.strokeStyle=TC.panel; ctx.lineWidth=0.5; ctx.strokeRect(x+.5,y+.5,TILE-1,TILE-1);
+
+  } else if(tipDist===2){
+    // ── Destination board row ──
+    if(isLeft||isRight){
+      R(x,y,TILE,TILE,TC.panel);
+      R(isLeft?x+TILE-3:x, y, 3, TILE, TC.dark);
+    } else {
+      R(x,y,TILE,TILE,'#111');
+      R(x+2,y+3,TILE-4,TILE-8,'#000');
+      ctx.fillStyle='#ffe800'; ctx.font='bold 6px monospace'; ctx.textAlign='center';
+      ctx.fillText('Route 1', x+TILE/2, y+14);
+      ctx.fillStyle='#ccc'; ctx.font='5px monospace';
+      ctx.fillText('UniMelb', x+TILE/2, y+24);
+    }
+    ctx.strokeStyle=TC.panel; ctx.lineWidth=0.5; ctx.strokeRect(x+.5,y+.5,TILE-1,TILE-1);
+
+  } else { // tipDist===3: closest to tram body (skirt/undercarriage)
+    R(x,y,TILE,TILE,'#555');
+    R(x+3,y+2,TILE-6,TILE-4,'#444');
+    R(x+4,y+(isTop?TILE-10:2),10,8,'#222');
+    R(x+TILE-14,y+(isTop?TILE-10:2),10,8,'#222');
+    if(isLeft||isRight) R(isLeft?x:x+TILE-3, y, 3, TILE, TC.panel);
+    ctx.strokeStyle=TC.panel; ctx.lineWidth=0.5; ctx.strokeRect(x+.5,y+.5,TILE-1,TILE-1);
+  }
+}
+
+// ── Door tile ─────────────────────────────────────
+function drawDoor(x,y,door,r,t){
+  const open=doorOpen(door,t);
+  if(open){
+    const fl=Math.sin(t/120)>0;
+    R(x,y,TILE,TILE,fl?'#003d18':'#002510');
+    R(x,y,4,TILE,'#00bb66'); R(x+TILE-4,y,4,TILE,'#00bb66');
+    if(r===door.rows[0]){
+      ctx.fillStyle='#00ff88'; ctx.font='bold 6px monospace'; ctx.textAlign='center';
+      ctx.fillText('OPEN',x+TILE/2,y+TILE/2+2);
+    }
+  } else {
+    R(x,y,TILE,TILE,'#2a1c00');
+    R(x+3,y+3,TILE-6,TILE-6,'#1e1400');
+    R(x+TILE/2-2,y,4,TILE,'#883300'); R(x,y+TILE/2-2,TILE,4,'#883300');
+    if(r===door.rows[0]){
+      ctx.fillStyle='#ff6600'; ctx.font='bold 5px monospace'; ctx.textAlign='center';
+      ctx.fillText('CLOSED',x+TILE/2,y+TILE/2+2);
+    }
+  }
+}
+
+// ── Bench (1×3 tiles, draw from top) ─────────────
+function drawBench3(x,y){
+  const H = TILE*3, W = TILE;
+  // Back rest
+  R(x+2, y+3, 5, H-6, '#3a2010');
+  // Seat board spans
+  for(let i=0;i<3;i++) R(x+7, y+4+i*TILE, W-12, TILE-8, '#5a3a1a');
+  // Slat highlights
+  for(let i=0;i<3;i++){
+    R(x+8,  y+5+i*TILE,  W-16, 5, '#7a5020');
+    R(x+8,  y+14+i*TILE, W-16, 4, '#6a4418');
+    R(x+8,  y+23+i*TILE, W-16, 4, '#5a3410');
+  }
+  // Legs (top and bottom)
+  R(x+W-10, y+6, 5, 10, '#3a2010');
+  R(x+W-10, y+H-16, 5, 10, '#3a2010');
+  // Armrests
+  R(x+2, y+3, W-4, 5, '#4a2e0e');
+}
+
+// ── Rotating ad board ────────────────────────────
+function drawAd(x,y,t){
+  const adIdx=Math.floor(t/3000)%AD_NAMES.length;
+  const ad=AD_NAMES[adIdx];
+  R(x+2,y+2,TILE-4,TILE-4,'#222');
+  R(x+4,y+4,TILE-8,TILE-8,'#111');
+  if(ad==='myki'){
+    R(x+4,y+4,TILE-8,TILE-8,'#00aacc');
+    ctx.fillStyle='#fff'; ctx.font='bold 7px monospace'; ctx.textAlign='center';
+    ctx.fillText('myki',x+TILE/2,y+16);
+    R(x+8,y+19,TILE-16,9,'#ffffff33');
+    ctx.fillStyle='#ffee00'; ctx.font='5px monospace'; ctx.fillText('tap on tap off',x+TILE/2,y+30);
+  } else if(ad==='PTV'){
+    R(x+4,y+4,TILE-8,TILE-8,'#6a1fcb');
+    ctx.fillStyle='#fff'; ctx.font='bold 9px monospace'; ctx.textAlign='center';
+    ctx.fillText('PTV',x+TILE/2,y+18);
+    ctx.fillStyle='#ffffff88'; ctx.font='5px monospace';
+    ctx.fillText('Public',x+TILE/2,y+25); ctx.fillText('Transport',x+TILE/2,y+31);
+  } else if(ad==='UniMelb'){
+    R(x+4,y+4,TILE-8,TILE-8,'#003d7c');
+    ctx.fillStyle='#ffd700'; ctx.font='bold 7px monospace'; ctx.textAlign='center';
+    ctx.fillText('UniMelb',x+TILE/2,y+16);
+    R(x+TILE/2-4,y+20,8,7,'#ffd700');
+    ctx.fillStyle='#fff'; ctx.font='5px monospace'; ctx.fillText('#1 in Aus',x+TILE/2,y+31);
+  } else {
+    R(x+4,y+4,TILE-8,TILE-8,'#cc0000');
+    ctx.fillStyle='#fff'; ctx.font='bold 6px monospace'; ctx.textAlign='center';
+    ctx.fillText('FARE',x+TILE/2,y+14); ctx.fillText('EVADER?',x+TILE/2,y+22);
+    ctx.fillStyle='#ffee00'; ctx.font='bold 5px monospace';
+    ctx.fillText('$226 FINE',x+TILE/2,y+30);
+  }
+  R(x+5,y+5,5,3,'#ffffff22'); // glare
+}
+
+// ══════════════════════════════════════════════════
+//  ENTITY DRAWING
+// ══════════════════════════════════════════════════
+function drawStudent(px,py,dir,ft,moving){
+  const x=Math.round(px-TILE/2), y=Math.round(py-TILE/2), S=TILE;
+  const f=Math.floor(ft/7)%2, la=moving?(f?4:-2):0, lb=moving?(f?-2:4):0;
+  ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.beginPath();
+  ctx.ellipse(px,py+S*0.42,S*0.22,S*0.08,0,0,Math.PI*2); ctx.fill();
+  const bx=dir>0?x+1:x+S-9;
+  R(bx,y+S*0.3,7,11,'#7b4f2a'); R(bx+1,y+S*0.32,5,9,'#9b6a3a'); R(bx+1,y+S*0.42,5,2,'#c8a060');
+  R(x+S*0.28,y+S*0.62,5,7+la,'#2a2a55'); R(x+S*0.52,y+S*0.62,5,7+lb,'#2a2a55');
+  R(x+S*0.25,y+S*0.62+6+la,7,3,'#111122'); R(x+S*0.49,y+S*0.62+6+lb,7,3,'#111122');
+  R(x+S*0.2,y+S*0.36,S*0.6,S*0.28,'#003d7c'); R(x+S*0.2,y+S*0.36,S*0.6,4,'#004d8c');
+  R(x+S*0.35,y+S*0.36,S*0.3,4,'#eee');
+  R(x+S*0.25,y+S*0.12,S*0.5,S*0.25,'#f5c58a'); R(x+S*0.25,y+S*0.12,S*0.5,3,'#e0a870');
+  R(x+S*0.25,y+S*0.12,S*0.5,5,'#3d2010');
+  const ex=dir>0?x+S*0.47:x+S*0.22;
+  R(ex,y+S*0.22,2,2,'#222'); R(ex+5,y+S*0.22,2,2,'#222');
+  R(x+S*0.22,y+S*0.44,4,4,'#0051a2'); R(x+S*0.24,y+S*0.46,2,2,'#ffd700');
+}
+
+function drawInspector(px,py,ft,excl){
+  const x=Math.round(px-TILE/2), y=Math.round(py-TILE/2), S=TILE;
+  const f=Math.floor(ft/7)%2;
+  // excl < 0 → wandering/confused (show flashing "?")
+  if(excl<0){
+    const blink=Math.floor(Date.now()/120)%2;
+    if(blink){
+      ctx.fillStyle='#ffe800'; ctx.font='bold 17px monospace'; ctx.textAlign='center';
+      ctx.fillText('?', px, y-4);
+    }
+  }
+  // excl > 0 → alert (show "!")
+  else if(excl>0){
+    const blink=Math.floor(Date.now()/80)%2;
+    if(blink){
+      ctx.fillStyle='#ff0000'; ctx.font='bold 18px monospace'; ctx.textAlign='center';
+      const marks = excl>60 ? '!!!' : excl>30 ? '!!' : '!';
+      ctx.fillText(marks, px, y-5);
+    }
+  }
+  ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.beginPath();
+  ctx.ellipse(px,py+S*0.42,S*0.22,S*0.08,0,0,Math.PI*2); ctx.fill();
+  R(x+S*0.28,y+S*0.62,5,7+(f?3:-1),'#1a1a3a'); R(x+S*0.52,y+S*0.62,5,7+(f?-1:3),'#1a1a3a');
+  R(x+S*0.25,y+S*0.62+6+(f?3:-1),7,3,'#111'); R(x+S*0.49,y+S*0.62+6+(f?-1:3),7,3,'#111');
+  R(x+S*0.18,y+S*0.36,S*0.64,S*0.28,'#cc5500'); R(x+S*0.18,y+S*0.36,S*0.64,4,'#dd6610');
+  R(x+S*0.18,y+S*0.44,S*0.64,3,'#ffe800'); R(x+S*0.18,y+S*0.55,S*0.64,3,'#ffe800');
+  R(x+S*0.18,y+S*0.36,2,S*0.28,'#1a1a3a'); R(x+S*0.78,y+S*0.36,2,S*0.28,'#1a1a3a');
+  R(x+S*0.25,y+S*0.12,S*0.5,S*0.25,'#f5c58a');
+  R(x+S*0.2,y+S*0.05,S*0.6,7,'#1a1a5a'); R(x+S*0.14,y+S*0.12,S*0.72,4,'#1a1a5a');
+  R(x+S*0.35,y+S*0.07,S*0.3,4,'#c8a020'); R(x+S*0.38,y+S*0.08,S*0.24,2,'#fff');
+  R(x+S*0.28,y+S*0.22,3,2,'#cc0000'); R(x+S*0.52,y+S*0.22,3,2,'#cc0000');
+  ctx.strokeStyle='#2a1005'; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.moveTo(x+S*0.28,y+S*0.17); ctx.lineTo(x+S*0.38,y+S*0.19); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x+S*0.72,y+S*0.17); ctx.lineTo(x+S*0.62,y+S*0.19); ctx.stroke();
+  ctx.fillStyle='#000'; ctx.font='5px monospace'; ctx.textAlign='center';
+  ctx.fillText('INSPECTOR',px,y+S*0.52);
+}
+
+function drawNPC(npc){
+  const px=npc.col*TILE+TILE/2, py=npc.row*TILE+TILE/2;
+  const x=Math.round(px-TILE/2), y=Math.round(py-TILE/2), S=TILE;
+  ctx.fillStyle='rgba(0,0,0,0.18)'; ctx.beginPath();
+  ctx.ellipse(px,py+S*0.42,S*0.2,S*0.07,0,0,Math.PI*2); ctx.fill();
+  R(x+S*0.22,y+S*0.36,S*0.56,S*0.28,npc.color);
+  R(x+S*0.22,y+S*0.36,S*0.56,3,'rgba(255,255,255,0.2)');
+  R(x+S*0.28,y+S*0.12,S*0.44,S*0.24,'#f0c080');
+  R(x+S*0.28,y+S*0.12,S*0.44,3,'#c09060');
+  R(x+S*0.28,y+S*0.62,4,7,'#555'); R(x+S*0.52,y+S*0.62,4,7,'#555');
+  R(x+S*0.26,y+S*0.62+6,6,3,'#333'); R(x+S*0.50,y+S*0.62+6,6,3,'#333');
+}
+
+// ══════════════════════════════════════════════════
+//  UPDATE
+// ══════════════════════════════════════════════════
+function update(t){
+  stateTimer++;
+
+  // ── Intro → skill select transition ──
+  if(state==='intro'){
+    if(stateTimer>460){ state='skillSelect'; stateTimer=0; }
+    return;
+  }
+
+  // ── Skill select: wait for key press ──
+  if(state==='skillSelect'){
+    tickPart();
+    if(pendingSkillStart){
+      pendingSkillStart=false;
+      // Apply chosen skill
+      if(selectedExtraSkill==='myki'){ mykiSkill.available=true; mykiSkill.used=false; mykiSkill.saveTimer=0; }
+      if(selectedExtraSkill==='rage'){ rageSkill.available=true; rageSkill.active=false; rageSkill.timer=0; rageSkill.cooldown=0; }
+      // Spawn new NPCs for levels 2+ (level already incremented)
+      if(currentLevel>1) spawnNewLevelNPCs();
+      state='playing';
+      levelStartMs=t;
+    }
+    return;
+  }
+
+  // ── Interrogation: pause game ──
+  if(state==='interrogation'){
+    tickPart();
+    return;
+  }
+
+  if(state!=='playing'){ tickPart(); return; }
+
+  // ── Level / win progression (per-level timing) ──
+  const levelElapsed=(t-levelStartMs)/1000;
+  // Speed multiplier: increases with each level
+  const lvlMult=1+0.18*(currentLevel-1);
+  if(levelBanner>0) levelBanner--;
+
+  if(levelElapsed >= LEVEL_DURATION){
+    if(currentLevel>=MAX_LEVELS){
+      state='won';
+      spawnPart(player.x,player.y,'#00ff88',20);
+      spawnPart(player.x,player.y,'#ffd700',15);
+      spawnPart(canvas.width/2,canvas.height/2,'#ff88ff',10);
+      return;
+    }
+    // Advance to next level — go through skill select
+    currentLevel++;
+    levelBanner=0;
+    if(extraInspectors.length < MAX_LEVELS-2) spawnExtraInspector();
+    // Reset inspector states for new round
+    tramIns.path=[]; tramIns.pathTimer=0;
+    platIns.path=[]; platIns.pathTimer=0;
+    for(const ei of extraInspectors){ ei.path=[]; ei.pathTimer=0; }
+    // Clear previous round's extra skill
+    selectedExtraSkill=null;
+    mykiSkill.available=false; mykiSkill.used=false; mykiSkill.saveTimer=0;
+    rageSkill.available=false; rageSkill.active=false; rageSkill.timer=0; rageSkill.cooldown=0;
+    state='skillSelect'; stateTimer=0;
+    return;
+  }
+
+  // ── Player movement ──
+  let dx=0,dy=0;
+  if(keys['ArrowLeft']||keys['a']||keys['A']) dx-=1;
+  if(keys['ArrowRight']||keys['d']||keys['D']) dx+=1;
+  if(keys['ArrowUp']||keys['w']||keys['W']) dy-=1;
+  if(keys['ArrowDown']||keys['s']||keys['S']) dy+=1;
+  if(dx&&dy){ dx*=0.707; dy*=0.707; }
+  player.moving=dx!==0||dy!==0;
+  if(player.moving){ player.ft++; if(dx) player.dir=dx>0?1:-1; }
+  const pSpd=player.speed*lvlMult;
+  moveEnt(player,dx*pSpd,dy*pSpd,t,true);
+
+  // ── Rage skill: push NPCs away ──
+  if(rageSkill.active){
+    for(const n of platNPCs){
+      const nx=n.col*TILE+TILE/2, ny=n.row*TILE+TILE/2;
+      const ddx=nx-player.x, ddy=ny-player.y;
+      const dist=Math.sqrt(ddx*ddx+ddy*ddy);
+      if(dist<TILE*1.8 && dist>0){
+        // Push NPC to adjacent tile away from player
+        const dc=ddx>0?1:ddx<0?-1:0;
+        const dr=ddy>0?1:ddy<0?-1:0;
+        const nc=n.col+dc, nr=n.row+dr;
+        if(isBasicWalkable(nc,nr,t)&&!isAnyNPCAt(nc,nr)){
+          n.col=nc; n.row=nr;
+        }
+      }
+    }
+    rageSkill.timer--;
+    if(rageSkill.timer<=0) deactivateRage();
+  } else if(rageSkill.cooldown>0){
+    rageSkill.cooldown--;
+  }
+
+  // ── Myki save timer ──
+  if(mykiSkill.saveTimer>0) mykiSkill.saveTimer--;
+
+  // ── Inspector wander helper (used when disguise active) ──
+  const inspectorSpeed=lvlMult;
+  function wanderInspector(ins){
+    if(!ins.wanderTimer||ins.wanderTimer<=0){
+      ins.wanderTimer=40+Math.floor(Math.random()*40);
+      const dirs=[[0,-1],[0,1],[-1,0],[1,0],[0,0]];
+      const d=dirs[Math.floor(Math.random()*dirs.length)];
+      ins.wanderDx=d[0]; ins.wanderDy=d[1];
+    }
+    ins.wanderTimer--;
+    const wSpd=0.35*inspectorSpeed;
+    if(ins.wanderDx!==0||ins.wanderDy!==0){
+      const prevX=ins.x, prevY=ins.y;
+      moveEnt(ins,ins.wanderDx*wSpd,ins.wanderDy*wSpd,t,false);
+      if(Math.abs(ins.x-prevX)<0.05&&Math.abs(ins.y-prevY)<0.05){
+        ins.wanderTimer=0; // blocked, pick new dir
+      }
+    }
+    ins.ft++;
+  }
+
+  // ── Inspector 1 (tramIns) AI ──
+  if(tramIns.phase==='waiting'){
+    tramIns.waitTimer--;
+    if(tramIns.waitTimer<=0){ tramIns.phase='chasing'; tramIns.path=[]; }
+  } else {
+    if(skill.active){
+      // Disguise: wander slowly, forget player
+      tramIns.path=[];
+      wanderInspector(tramIns);
+      // Only detect if extremely close
+      const ddx=player.x-tramIns.x, ddy=player.y-tramIns.y;
+      const dist=Math.sqrt(ddx*ddx+ddy*ddy);
+      if(dist<TILE*0.6){ catchPlayer(); return; }
+    } else {
+      const ddx=player.x-tramIns.x, ddy=player.y-tramIns.y;
+      const dist=Math.sqrt(ddx*ddx+ddy*ddy);
+      if(dist<TILE*0.75){ catchPlayer(); return; }
+      tramIns.pathTimer++;
+      if(tramIns.pathTimer>=28||tramIns.path.length===0){
+        tramIns.pathTimer=0;
+        tramIns.path=astar(Math.floor(tramIns.x/TILE),Math.floor(tramIns.y/TILE),
+                           Math.floor(player.x/TILE),Math.floor(player.y/TILE),t);
+      }
+      followPath(tramIns, tramIns.chaseSpd*inspectorSpeed);
+    }
+  }
+
+  // ── Inspector 2 (platIns) AI ──
+  const playerOnPlat = Math.floor(player.x/TILE) < PLAT_W;
+  if(skill.active){
+    // Wander on platform
+    platIns.path=[];
+    wanderInspector(platIns);
+    const ddx=player.x-platIns.x, ddy=player.y-platIns.y;
+    const dist=Math.sqrt(ddx*ddx+ddy*ddy);
+    if(dist<TILE*0.6){ catchPlayer(); return; }
+  } else if(playerOnPlat){
+    if(platIns.phase==='patrol') platIns.alertTimer=120;
+    platIns.phase='alert';
+    const ddx=player.x-platIns.x, ddy=player.y-platIns.y;
+    const dist=Math.sqrt(ddx*ddx+ddy*ddy);
+    if(dist<TILE*0.75){ catchPlayer(); return; }
+    platIns.pathTimer++;
+    if(platIns.pathTimer>=28||platIns.path.length===0){
+      platIns.pathTimer=0;
+      platIns.path=astar(Math.floor(platIns.x/TILE),Math.floor(platIns.y/TILE),
+                         Math.floor(player.x/TILE),Math.floor(player.y/TILE),t);
+    }
+    followPath(platIns, platIns.alertSpd*inspectorSpeed);
+    if(platIns.alertTimer>0) platIns.alertTimer--;
+  } else {
+    platIns.phase='patrol';
+    platIns.alertTimer=0; platIns.path=[];
+    const prevY=platIns.y;
+    moveEnt(platIns,0,platIns.patrolDir*platIns.patrolSpd*inspectorSpeed,t,false);
+    if(Math.abs(platIns.y-prevY)<0.05) platIns.patrolDir*=-1;
+    platIns.ft++;
+  }
+
+  // ── Extra inspectors ──
+  for(const ei of extraInspectors){
+    const ddx=player.x-ei.x, ddy=player.y-ei.y;
+    const dist=Math.sqrt(ddx*ddx+ddy*ddy);
+    if(skill.active){
+      ei.path=[];
+      wanderInspector(ei);
+      if(dist<TILE*0.6){ catchPlayer(); return; }
+    } else {
+      if(dist<TILE*0.75){ catchPlayer(); return; }
+      ei.pathTimer++;
+      if(ei.pathTimer>=28||ei.path.length===0){
+        ei.pathTimer=0;
+        ei.path=astar(Math.floor(ei.x/TILE),Math.floor(ei.y/TILE),
+                      Math.floor(player.x/TILE),Math.floor(player.y/TILE),t);
+      }
+      followPath(ei, ei.chaseSpd*inspectorSpeed);
+    }
+  }
+
+  // ── Disguise skill timer ──
+  if(skill.active){
+    skill.timer--;
+    if(skill.timer<=0) deactivateSkill();
+  } else if(skill.cooldown>0){
+    skill.cooldown--;
+  }
+
+  // ── NPC movement speed scales with level ──
+  // Faster move period at higher levels (lower = faster)
+  for(const n of platNPCs){
+    n._scaledPeriod = Math.max(20, Math.round(n.movePeriod / lvlMult));
+  }
+  updatePlatNPCs(t);
+  updateTramNPCs(t);
+  tickPart();
+}
+
+// ══════════════════════════════════════════════════
+//  DRAW FRAME
+// ══════════════════════════════════════════════════
+function draw(t){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  R(0,0,canvas.width,canvas.height,'#0e0e0e');
+
+  drawMap(t);
+
+  // Draw all NPCs
+  for(const n of platNPCs) drawNPC(n);
+  for(const n of tramNPCs) drawNPC(n);
+
+  // Inspectors (base 2 + extras)
+  // Pass excl=-1 when player is disguised so they show "?" above head
+  const insExcl = skill.active ? -1 : 0;
+  drawInspector(tramIns.x, tramIns.y, tramIns.ft, insExcl);
+  drawInspector(platIns.x, platIns.y, platIns.ft,
+                skill.active ? -1 : (platIns.phase==='alert' ? platIns.alertTimer : 0));
+  for(const ei of extraInspectors) drawInspector(ei.x,ei.y,ei.ft,insExcl);
+
+  // Player — disguise mode or normal
+  if(state!=='caught'){
+    if(skill.active){
+      // flash every 8 frames during last 2 s
+      const flash = skill.timer < SKILL_FLASH && Math.floor(skill.timer/8)%2===1;
+      if(!flash) drawNPCAt(player.x, player.y, skill.disguiseColor);
+    } else {
+      // Rage glow around player
+      if(rageSkill.active){
+        ctx.save();
+        ctx.globalAlpha=0.35+0.15*Math.sin(Date.now()*0.02);
+        ctx.fillStyle='#ff4400';
+        ctx.beginPath();
+        ctx.arc(player.x,player.y,TILE*0.72,0,Math.PI*2);
+        ctx.fill();
+        ctx.globalAlpha=1;
+        ctx.restore();
+      }
+      drawStudent(player.x,player.y,player.dir,player.ft,player.moving);
+    }
+  }
+
+  // Particles
+  for(const p of particles){
+    ctx.globalAlpha=Math.max(0,p.life/p.maxLife);
+    ctx.fillStyle=p.col;
+    ctx.fillRect(p.x-p.size/2,p.y-p.size/2,p.size,p.size);
+  }
+  ctx.globalAlpha=1;
+
+  // ── HUD ──
+  if(state==='playing'){
+    const levelElapsed=(t-levelStartMs)/1000;
+    const levelRem=Math.max(0,LEVEL_DURATION-levelElapsed);
+    const prog=levelRem/LEVEL_DURATION;
+    const tCol=prog>0.5?'#00ff88':prog>0.25?'#ffcc00':'#ff4444';
+
+    // Level segment bar across top
+    const segW=Math.floor(canvas.width/MAX_LEVELS)-1;
+    for(let l=0;l<MAX_LEVELS;l++){
+      const lx=l*(segW+1);
+      R(lx,0,segW,7,l<currentLevel-1?'#007733':l===currentLevel-1?'#1a1a1a':'#111');
+    }
+    R((currentLevel-1)*(segW+1),0,Math.round(segW*prog),7,tCol);
+
+    // Text HUD bar at bottom
+    R(0,canvas.height-24,canvas.width,24,'rgba(0,0,0,0.70)');
+    ctx.fillStyle=tCol; ctx.font='bold 15px monospace'; ctx.textAlign='left';
+    ctx.fillText(`L${currentLevel} ⏱${Math.ceil(levelRem)}s`,8,canvas.height-7);
+    ctx.textAlign='center'; ctx.fillStyle='#ffcc00';
+    ctx.fillText(`Round ${currentLevel}/${MAX_LEVELS} · ${2+extraInspectors.length} inspectors`,canvas.width/2,canvas.height-7);
+    ctx.textAlign='right'; ctx.fillStyle='#ff4444';
+    ctx.fillText('Fine: $226',canvas.width-8,canvas.height-7);
+
+    // Level-up banner
+    if(levelBanner>0){
+      const ba=Math.min(1,levelBanner/30);
+      ctx.globalAlpha=ba;
+      R(canvas.width/2-110,canvas.height/2-28,220,54,'rgba(0,0,0,0.88)');
+      ctx.strokeStyle='#ffd700'; ctx.lineWidth=2;
+      ctx.strokeRect(canvas.width/2-110,canvas.height/2-28,220,54);
+      ctx.fillStyle='#ffd700'; ctx.font='bold 18px monospace'; ctx.textAlign='center';
+      ctx.fillText(`ROUND ${currentLevel}`,canvas.width/2,canvas.height/2);
+      ctx.fillStyle='#ff4444'; ctx.font='13px monospace';
+      ctx.fillText(`+1 Inspector (${2+extraInspectors.length} total)`,canvas.width/2,canvas.height/2+18);
+      ctx.globalAlpha=1;
+    }
+
+    // ── Skill HUD (bottom centre) ──
+    const skW=90, skH=7, skX=canvas.width/2-skW/2, skY=canvas.height-20;
+    if(skill.active){
+      const prog=skill.timer/SKILL_DUR;
+      const sCol=skill.timer<SKILL_FLASH?'#ff8800':'#00ddff';
+      R(skX-1,skY-1,skW+2,skH+2,'#000');
+      R(skX,skY,skW,skH,'#1a2a2a');
+      R(skX,skY,Math.round(skW*prog),skH,sCol);
+      ctx.fillStyle=sCol; ctx.font='bold 11px monospace'; ctx.textAlign='center';
+      ctx.fillText('🥷 DISGUISE',canvas.width/2,skY-3);
+    } else if(skill.cooldown>0){
+      const prog=1-skill.cooldown/SKILL_CD;
+      R(skX-1,skY-1,skW+2,skH+2,'#000');
+      R(skX,skY,skW,skH,'#1a1a1a');
+      R(skX,skY,Math.round(skW*prog),skH,'#334455');
+      ctx.fillStyle='#556677'; ctx.font='10px monospace'; ctx.textAlign='center';
+      ctx.fillText('recharging…',canvas.width/2,skY-3);
+    } else {
+      ctx.fillStyle='#00ddff'; ctx.font='bold 11px monospace'; ctx.textAlign='center';
+      ctx.fillText('[SPACE] 🥷 Disguise',canvas.width/2,skY+6);
+    }
+
+    // ── Extra skill HUD (top-left corner) ──
+    if(mykiSkill.available){
+      const col=mykiSkill.used?'#556655':'#00ff88';
+      R(4,10,62,18,'rgba(0,0,0,0.7)');
+      ctx.strokeStyle=col; ctx.lineWidth=1; ctx.strokeRect(4,10,62,18);
+      ctx.fillStyle=col; ctx.font='bold 11px monospace'; ctx.textAlign='left';
+      ctx.fillText(mykiSkill.used?'MYKI ✓':'⭐ MYKI', 8, 22);
+    }
+    if(rageSkill.available){
+      const rCol=rageSkill.active?'#ff4400':rageSkill.cooldown>0?'#664422':'#ff8844';
+      R(4,32,62,18,'rgba(0,0,0,0.7)');
+      ctx.strokeStyle=rCol; ctx.lineWidth=1; ctx.strokeRect(4,32,62,18);
+      ctx.fillStyle=rCol; ctx.font='bold 11px monospace'; ctx.textAlign='left';
+      if(rageSkill.active){
+        const tp=rageSkill.timer/RAGE_DUR;
+        R(5,33,Math.round(60*tp),16,'rgba(255,80,0,0.3)');
+        ctx.fillText('🔥 RAGE', 8, 44);
+      } else if(rageSkill.cooldown>0){
+        ctx.fillText('[Q] …cd', 8, 44);
+      } else {
+        ctx.fillText('[Q] RAGE', 8, 44);
+      }
+    }
+
+    // Myki saved toast
+    if(mykiSkill.saveTimer>0){
+      const ta=Math.min(1,mykiSkill.saveTimer/30);
+      ctx.globalAlpha=ta;
+      ctx.fillStyle='#00ff88'; ctx.font='bold 18px monospace'; ctx.textAlign='center';
+      ctx.fillText('⭐ MYKI SAVED!', canvas.width/2, canvas.height/2-50);
+      ctx.globalAlpha=1;
+    }
+  }
+
+  // ── OVERLAYS ──
+  function box(bw,bh,bc,sc){
+    const bx=(canvas.width-bw)/2, by=canvas.height/2-bh/2;
+    R(bx,by,bw,bh,bc); ctx.strokeStyle=sc; ctx.lineWidth=2; ctx.strokeRect(bx,by,bw,bh);
+    return {bx,by};
+  }
+
+  if(state==='intro'){
+    drawIntroCutscene(stateTimer);
+
+  } else if(state==='skillSelect'){
+    drawSkillSelect();
+
+  } else if(state==='interrogation'){
+    drawInterrogation();
+
+  } else if(state==='caught'){
+    R(0,0,canvas.width,canvas.height,'rgba(180,0,0,0.14)');
+    const{bx,by}=box(canvas.width*0.86,130,'rgba(8,0,0,0.92)','#ff4444');
+    ctx.fillStyle='#ff3333'; ctx.font='bold 26px monospace'; ctx.textAlign='center';
+    ctx.fillText('BUSTED! 🚔',canvas.width/2,by+38);
+    ctx.fillStyle='#ccc'; ctx.font='14px monospace';
+    ctx.fillText('Infringement Notice Issued',canvas.width/2,by+60);
+    ctx.fillText('Fine: $226.00 — No valid myki tap-on',canvas.width/2,by+76);
+    ctx.fillStyle='#888'; ctx.font='13px monospace';
+    ctx.fillText('[ R ]  Try Again',canvas.width/2,by+108);
+
+  } else if(state==='won'){
+    R(0,0,canvas.width,canvas.height,'rgba(0,180,60,0.14)');
+    const{bx,by}=box(canvas.width*0.88,150,'rgba(0,10,0,0.93)','#00ff88');
+    ctx.fillStyle='#00ff88'; ctx.font='bold 25px monospace'; ctx.textAlign='center';
+    ctx.fillText('ALL 5 ROUNDS SURVIVED! 🎉',canvas.width/2,by+36);
+    ctx.fillStyle='#ffd700'; ctx.font='14px monospace';
+    ctx.fillText('150 seconds — no valid myki tap-on!',canvas.width/2,by+58);
+    ctx.fillText(`Evaded ${MAX_LEVELS} rounds of inspectors!`,canvas.width/2,by+74);
+    ctx.fillStyle='#88ff88'; ctx.font='13px monospace';
+    ctx.fillText('$226 fine avoided — UniMelb solidarity 😅',canvas.width/2,by+92);
+    ctx.fillStyle='#ff8844'; ctx.font='12px monospace';
+    ctx.fillText('(But seriously, please tap on next time)',canvas.width/2,by+108);
+    ctx.fillStyle='#888';
+    ctx.fillText('[ R ]  Play Again',canvas.width/2,by+132);
+  }
+}
+
+// ══════════════════════════════════════════════════
+//  RESTART
+// ══════════════════════════════════════════════════
+function restart(){
+  player.x=7.5*TILE; player.y=16.5*TILE; player.ft=0; player.moving=false; player.dir=1;
+
+  tramIns.x=2.5*TILE; tramIns.y=1.5*TILE;
+  tramIns.phase='waiting'; tramIns.waitTimer=100; tramIns.ft=0;
+  tramIns.path=[]; tramIns.pathTimer=0;
+
+  platIns.x=2.5*TILE; platIns.y=20.5*TILE;
+  platIns.phase='patrol'; platIns.patrolDir=-1;
+  platIns.alertTimer=0; platIns.ft=0;
+  platIns.path=[]; platIns.pathTimer=0;
+
+  skill.active=false; skill.timer=0; skill.cooldown=0;
+  currentLevel=1; levelBanner=0;
+  extraInspectors.length=0;
+
+  selectedExtraSkill=null; pendingSkillStart=false;
+  mykiSkill.available=false; mykiSkill.used=false; mykiSkill.saveTimer=0;
+  rageSkill.available=false; rageSkill.active=false; rageSkill.timer=0; rageSkill.cooldown=0;
+
+  // Reset interrogation
+  const inp=document.getElementById('chatInput');
+  if(inp) inp.style.display='none';
+  interro.phase='intro'; interro.question=''; interro.playerText='';
+  interro.verdict=null; interro.verdictMsg=''; interro.reason='';
+  interro.introTimer=80; interro.thinkDots=0; interro.thinkTimer=0;
+
+  particles.length=0; state='intro'; stateTimer=0; startMs=0; levelStartMs=0;
+  initNPCs();
+}
+
+// ══════════════════════════════════════════════════
+//  GAME LOOP
+// ══════════════════════════════════════════════════
+function loop(t){ update(t); draw(t); requestAnimationFrame(loop); }
+initNPCs();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
