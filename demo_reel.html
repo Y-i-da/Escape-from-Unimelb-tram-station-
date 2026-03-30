@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tram Dodger — Demo Reel</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#000;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden;}
+canvas{image-rendering:pixelated;image-rendering:crisp-edges;}
+</style>
+</head>
+<body>
+<canvas id="c" width="396" height="792"></canvas>
+<script>
+// ─── BGM (same as main game) ───
+let audioCtx=null, bgmMuted=false;
+const MELODY=[220,0,262,0,220,196,0,220,0,294,262,0,220,196,174,0];
+const BASS  =[110,0,110,0,110,98, 0,110,0,147,131,0,110,98, 87, 0];
+let melodyStep=0, bassStep=0;
+function initAudio(){
+  if(audioCtx) return;
+  audioCtx=new(window.AudioContext||window.webkitAudioContext)();
+  scheduleBGM();
+}
+function playNote(freq,type,dur,gain,st){
+  if(!audioCtx||bgmMuted||freq===0) return;
+  const osc=audioCtx.createOscillator();
+  const g=audioCtx.createGain();
+  osc.connect(g); g.connect(audioCtx.destination);
+  osc.type=type; osc.frequency.value=freq;
+  g.gain.setValueAtTime(gain,st);
+  g.gain.exponentialRampToValueAtTime(0.001,st+dur*0.9);
+  osc.start(st); osc.stop(st+dur);
+}
+function scheduleBGM(){
+  if(!audioCtx) return;
+  const now=audioCtx.currentTime, stepDur=0.13;
+  for(let i=0;i<4;i++){
+    const t=now+i*stepDur;
+    const mi=(melodyStep+i)%MELODY.length;
+    const bi=(bassStep+i)%BASS.length;
+    if(MELODY[mi]>0) playNote(MELODY[mi],'square',stepDur*0.85,0.08,t);
+    if(BASS[bi]>0)   playNote(BASS[bi],'sawtooth',stepDur*0.9,0.06,t);
+  }
+  melodyStep=(melodyStep+4)%MELODY.length;
+  bassStep=(bassStep+4)%BASS.length;
+  setTimeout(scheduleBGM,3*0.13*1000);
+}
+// Auto-start BGM on first interaction
+document.addEventListener('click', ()=>initAudio(), {once:true});
+document.addEventListener('keydown', ()=>initAudio(), {once:true});
+// Also try to auto-start after a brief delay (works if autoplay policy allows)
+setTimeout(()=>{
+  try{ initAudio(); } catch(e){}
+}, 300);
+
+// ─── Demo Reel: "Escape from UniMelb Tram Station" ───
+// Auto-plays a ~12 second cinematic showcase, then loops
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+const W = canvas.width, H = canvas.height;
+const TILE = 36;
+
+function R(x,y,w,h,col){ ctx.fillStyle=col; ctx.fillRect(Math.round(x),Math.round(y),w,h); }
+
+// ── SCENE DEFINITIONS ──
+// Each scene has: duration (frames), draw(f) function
+// Total ~720 frames @ 60fps = 12 seconds
+
+const SCENES = [
+  { dur: 180, draw: sceneTitle },     // 0-180:  Title card (3s)
+  { dur: 200, draw: sceneGameplay },  // 180-380: Gameplay snippet (3.3s)
+  { dur: 160, draw: sceneChase },     // 380-540: Chase + catch (2.7s)
+  { dur: 180, draw: sceneInterro },   // 540-720: Interrogation (3s)
+];
+let globalFrame = 0;
+let loopStart = 0;
+
+// ── TITLE SCENE ──
+function sceneTitle(f){
+  R(0,0,W,H,'#050510');
+  // Stars
+  for(let i=0;i<60;i++){
+    const sx=(i*137+i*i*31)%W, sy=(i*89+i*51)%(H*0.5);
+    if(Math.sin(f*0.07+i*1.7)>0.3) R(sx,sy,2,2,'#ffffffbb');
+  }
+  // City silhouette
+  const bld=[[0,55,38,75],[38,35,30,65],[68,22,50,78],[118,45,32,55],
+             [150,14,44,76],[194,38,30,52],[224,50,40,60],[264,25,35,75]];
+  for(const[bx,btop,bw,bh] of bld){
+    R(bx,H*0.42-bh,bw,bh,'#0d0d22');
+    for(let wy=H*0.42-bh+5;wy<H*0.42-4;wy+=10)
+      for(let wx=bx+3;wx<bx+bw-3;wx+=7)
+        if((wx*7+wy*13+bx)%5>1) R(wx,wy,3,5,'rgba(255,230,80,0.22)');
+  }
+  // Platform
+  R(0,H*0.72,W,36,'#8a7e70'); R(0,H*0.72,W,3,'#aaa');
+
+  // Tram on left
+  const tW=88, tH=TILE*3.2, tX=0, tY=H*0.72-tH+36;
+  R(tX,tY,tW,tH,'#1a6b2a');
+  R(tX+4,tY+6,tW-8,TILE,'#1a3a6a');
+  R(tX+7,tY+9,tW-14,TILE-6,'#2060b0');
+
+  // Student running right
+  if(f>20){
+    const sX = Math.min(W-50, (f-20)*3.8+tW+30);
+    drawStudent(sX, H*0.74, 1, f, true);
+  }
+  // Inspector chasing
+  if(f>40){
+    const iX = Math.min(W-20, (f-40)*2.8+tW+10);
+    drawInspector(iX, H*0.74, f, f>60?90:0);
+  }
+
+  // Title slides
+  const ta1 = Math.min(1,f/20);
+  ctx.globalAlpha=ta1;
+  ctx.fillStyle='#ff4444'; ctx.font='bold 20px monospace'; ctx.textAlign='center';
+  ctx.shadowColor='#ff0000'; ctx.shadowBlur=12;
+  ctx.fillText('ESCAPE FROM', W/2-(1-Math.min(1,f/22))*W*0.6, H*0.09);
+  ctx.shadowBlur=0; ctx.globalAlpha=1;
+
+  if(f>=15){
+    ctx.globalAlpha=Math.min(1,(f-15)/20);
+    ctx.fillStyle='#00ccff'; ctx.font='bold 38px monospace';
+    ctx.shadowColor='#0088ff'; ctx.shadowBlur=20;
+    ctx.fillText('UNIMELB', W/2+(1-Math.min(1,(f-15)/28))*W*0.5, H*0.17);
+    ctx.shadowBlur=0; ctx.globalAlpha=1;
+  }
+  if(f>=30){
+    ctx.globalAlpha=Math.min(1,(f-30)/20);
+    ctx.fillStyle='#ffd700'; ctx.font='bold 24px monospace';
+    ctx.shadowColor='#ffaa00'; ctx.shadowBlur=14;
+    ctx.fillText('TRAM STATION', W/2-(1-Math.min(1,(f-30)/28))*W*0.5, H*0.25);
+    ctx.shadowBlur=0; ctx.globalAlpha=1;
+  }
+  if(f>=80){
+    ctx.globalAlpha=Math.min(1,(f-80)/20);
+    ctx.fillStyle='#c8d8e8'; ctx.font='11px monospace'; ctx.textAlign='center';
+    ctx.fillText("Melbourne's most ticketed tram stop.", W/2, H*0.33);
+    ctx.fillText("Survive 5 rounds of inspectors.", W/2, H*0.33+16);
+    ctx.globalAlpha=1;
+  }
+  if(f>=120){
+    ctx.globalAlpha=Math.min(1,(f-120)/20)*0.8;
+    ctx.fillStyle='#8899bb'; ctx.font='italic 10px monospace';
+    ctx.fillText('— By Ellitt and Nannan —', W/2, H*0.40);
+    ctx.globalAlpha=1;
+  }
+  // Fade out last 30 frames
+  if(f>150){
+    ctx.fillStyle=`rgba(0,0,0,${(f-150)/30})`;
+    ctx.fillRect(0,0,W,H);
+  }
+}
+
+// ── GAMEPLAY SCENE ──
+function sceneGameplay(f){
+  // Draw mini-map background
+  R(0,0,W,H,'#1a1a2a');
+  // Platform tiles
+  for(let r=0;r<22;r++){
+    for(let c=0;c<5;c++){
+      R(c*TILE,r*TILE,TILE,TILE,(c+r)%2===0?'#b0a898':'#a89e90');
+      ctx.strokeStyle='#95897c'; ctx.lineWidth=0.5;
+      ctx.strokeRect(c*TILE+.5,r*TILE+.5,TILE-1,TILE-1);
+    }
+  }
+  // Tram wall
+  for(let r=0;r<22;r++) R(5*TILE,r*TILE,TILE,'#2a2a4a');
+  // Tram interior
+  for(let r=0;r<22;r++){
+    R(6*TILE,r*TILE,TILE,TILE,'#0d1a0d');
+    R(7*TILE,r*TILE,TILE,TILE,'#0d1a0d');
+  }
+  // Tracks
+  for(let r=0;r<22;r++){
+    R(9*TILE,r*TILE,TILE,TILE,'#191919');
+    R(10*TILE,r*TILE,TILE,TILE,'#191919');
+  }
+
+  // HUD
+  R(0,H-28,W,28,'rgba(0,0,0,0.8)');
+  ctx.fillStyle='#00ff88'; ctx.font='bold 13px monospace'; ctx.textAlign='left';
+  ctx.fillText(`L1 ⏱${Math.max(0,30-Math.floor(f/2))}s`, 8, H-8);
+  ctx.textAlign='center'; ctx.fillStyle='#ffcc00';
+  ctx.fillText('Round 1/5 · 2 inspectors', W/2, H-8);
+  ctx.textAlign='right'; ctx.fillStyle='#ff4444';
+  ctx.fillText('Fine: $226', W-8, H-8);
+
+  // NPCs scattered on platform
+  const npcData=[
+    {c:1,r:3,col:'#e88060'},{c:3,r:7,col:'#50c878'},{c:2,r:11,col:'#9060d0'},
+    {c:1,r:15,col:'#d0a030'},{c:4,r:5,col:'#50a8d8'},{c:3,r:18,col:'#d06890'},
+  ];
+  for(const n of npcData) drawNPC(n);
+
+  // Player moves around
+  const px = 2*TILE+TILE/2 + Math.sin(f*0.04)*TILE*0.8;
+  const py = 10*TILE+TILE/2 + Math.cos(f*0.03)*TILE*1.2;
+  drawStudent(px, py, Math.sin(f*0.04)>0?1:-1, f, true);
+
+  // Inspector 1 chasing from top
+  const i1x = 2*TILE+TILE/2 + Math.sin(f*0.04+0.5)*TILE;
+  const i1y = Math.min(py-TILE*2, 3*TILE + f*0.8);
+  drawInspector(i1x, i1y, f, f>60?120:0);
+
+  // Inspector 2 patrolling bottom
+  const i2y = 19*TILE+TILE/2 + Math.sin(f*0.02)*TILE*2;
+  drawInspector(2*TILE+TILE/2, i2y, f, 0);
+
+  // Skill bar
+  const skX=W/2-45, skY=H-50;
+  R(skX-1,skY-1,92,10,'#000');
+  const skP=Math.max(0,(200-f)/200);
+  R(skX,skY,90,8,'#1a2a2a');
+  R(skX,skY,Math.round(90*skP),8,'#00ddff');
+  ctx.fillStyle='#00ddff'; ctx.font='bold 9px monospace'; ctx.textAlign='center';
+  ctx.fillText('[SPACE] 🥷 Disguise',W/2,skY-3);
+
+  // "Disguise active" banner (mid scene)
+  if(f>80&&f<140){
+    const da=Math.sin((f-80)/60*Math.PI);
+    ctx.globalAlpha=da;
+    R(W/2-90,H*0.4-16,180,26,'rgba(0,0,0,0.85)');
+    ctx.fillStyle='#00ddff'; ctx.font='bold 12px monospace'; ctx.textAlign='center';
+    ctx.fillText('🥷  DISGUISE ACTIVE!', W/2, H*0.4+4);
+    ctx.globalAlpha=1;
+  }
+
+  // Fade in
+  if(f<20){ ctx.fillStyle=`rgba(0,0,0,${1-f/20})`; ctx.fillRect(0,0,W,H); }
+  // Fade out
+  if(f>180){ ctx.fillStyle=`rgba(0,0,0,${(f-180)/20})`; ctx.fillRect(0,0,W,H); }
+}
+
+// ── CHASE SCENE ──
+function sceneChase(f){
+  R(0,0,W,H,'#1a1a2a');
+  // Quick platform draw
+  for(let r=0;r<22;r++) for(let c=0;c<5;c++){
+    R(c*TILE,r*TILE,TILE,TILE,(c+r)%2===0?'#b0a898':'#a89e90');
+  }
+  for(let r=0;r<22;r++) R(5*TILE,r*TILE,TILE,TILE,'#2a2a4a');
+  for(let r=0;r<22;r++){ R(6*TILE,r*TILE,TILE,TILE,'#0d1a0d'); R(7*TILE,r*TILE,TILE,TILE,'#0d1a0d'); }
+
+  // Player running — trying to escape
+  const progress = Math.min(1, f/100);
+  const px = 3*TILE + (1-progress)*TILE*0.5;
+  const py = 10*TILE + TILE/2 - Math.sin(progress*Math.PI)*TILE;
+  const pDir = f<60 ? (Math.sin(f*0.1)>0?1:-1) : -1;
+  drawStudent(px, py, pDir, f, true);
+
+  // 3 inspectors converging
+  const i1x = TILE/2 + progress*TILE*2.5;
+  const i1y = 8*TILE + progress*TILE*2;
+  drawInspector(i1x, i1y, f, f>30?160:0);
+
+  const i2x = 4*TILE + TILE/2;
+  const i2y = 14*TILE - progress*TILE*3;
+  drawInspector(i2x, i2y, f, f>40?140:0);
+
+  const i3x = TILE + progress*TILE*2;
+  const i3y = 10*TILE + TILE/2;
+  drawInspector(i3x, i3y, f, f>50?120:0);
+
+  // Round 3 HUD
+  R(0,H-28,W,28,'rgba(0,0,0,0.8)');
+  ctx.fillStyle='#ff4444'; ctx.font='bold 13px monospace'; ctx.textAlign='left';
+  ctx.fillText('L3 ⏱8s', 8, H-8);
+  ctx.textAlign='center'; ctx.fillStyle='#ffcc00';
+  ctx.fillText('Round 3/5 · 4 inspectors', W/2, H-8);
+
+  // Catch moment
+  if(f>100){
+    const ca = Math.min(1,(f-100)/20);
+    ctx.globalAlpha=ca*0.5;
+    ctx.fillStyle='#ff0000';
+    ctx.fillRect(0,0,W,H);
+    ctx.globalAlpha=1;
+  }
+  if(f>110){
+    const blink = Math.floor((f-100)/8)%2;
+    if(blink){
+      ctx.fillStyle='#ffffff'; ctx.font='bold 22px monospace'; ctx.textAlign='center';
+      ctx.fillText('CAUGHT!', W/2, H/2);
+    }
+  }
+
+  // Particles burst
+  if(f>100){
+    const pf=f-100;
+    for(let i=0;i<12;i++){
+      const angle = (i/12)*Math.PI*2;
+      const dist = pf*2.2;
+      const px2 = px + Math.cos(angle)*dist;
+      const py2 = py + Math.sin(angle)*dist;
+      const a = Math.max(0, 1-pf/40);
+      ctx.globalAlpha=a;
+      ctx.fillStyle='#ff3300';
+      ctx.fillRect(px2-3,py2-3,6,6);
+      ctx.globalAlpha=1;
+    }
+  }
+
+  if(f<20){ ctx.fillStyle=`rgba(0,0,0,${1-f/20})`; ctx.fillRect(0,0,W,H); }
+}
+
+// ── INTERROGATION SCENE ──
+function sceneInterro(f){
+  // Dark game behind
+  R(0,0,W,H,'rgba(0,0,20,0.92)');
+  // Quick background
+  for(let r=0;r<22;r++) for(let c=0;c<5;c++)
+    R(c*TILE,r*TILE,TILE,TILE,(c+r)%2===0?'#3a3030':'#2d2828');
+
+  // Inspector avatar big & centered
+  drawInspector(W/2, H*0.18, f, f>20?120:0);
+
+  // Title bar
+  R(0, H*0.26, W, 30, '#1a0808');
+  ctx.strokeStyle='#ff4444'; ctx.lineWidth=2;
+  ctx.strokeRect(0, H*0.26, W, 30);
+  ctx.fillStyle='#ff4444'; ctx.font='bold 15px monospace'; ctx.textAlign='center';
+  ctx.fillText('🚨  TICKET INSPECTION  🚨', W/2, H*0.26+21);
+
+  // Inspector question
+  if(f>20){
+    const qa = Math.min(1,(f-20)/25);
+    ctx.globalAlpha=qa;
+    R(16, H*0.365, W-32, 66, '#0d0520');
+    ctx.strokeStyle='#cc44ff'; ctx.lineWidth=1.5;
+    ctx.strokeRect(16, H*0.365, W-32, 66);
+    ctx.fillStyle='#cc44ff'; ctx.font='bold 11px monospace'; ctx.textAlign='left';
+    ctx.fillText('INSPECTOR:', 24, H*0.365+18);
+    ctx.fillStyle='#ffffff'; ctx.font='12px monospace';
+    ctx.fillText('No valid myki detected!', 24, H*0.365+34);
+    ctx.fillText('Where is your ticket?!', 24, H*0.365+50);
+    ctx.globalAlpha=1;
+  }
+
+  // Player typing
+  if(f>50){
+    const ta = Math.min(1,(f-50)/20);
+    ctx.globalAlpha=ta;
+    R(16, H*0.58, W-32, 48, '#0a1a0a');
+    ctx.strokeStyle='#00ff88'; ctx.lineWidth=1;
+    ctx.strokeRect(16, H*0.58, W-32, 48);
+    ctx.fillStyle='#00ff88'; ctx.font='bold 11px monospace'; ctx.textAlign='left';
+    ctx.fillText('YOU:', 24, H*0.58+16);
+    const typed = "I'm a student, my myki app crashed!";
+    const charCount = Math.min(typed.length, Math.floor((f-50)*1.2));
+    ctx.fillStyle='#ccffcc'; ctx.font='12px monospace';
+    ctx.fillText(typed.substring(0,charCount) + (f%18<9?'|':''), 24, H*0.58+34);
+    ctx.globalAlpha=1;
+  }
+
+  // Thinking dots
+  if(f>95&&f<135){
+    const dots = '.'.repeat(Math.floor((f-95)/12)%4);
+    ctx.fillStyle='#ffcc00'; ctx.font='bold 13px monospace'; ctx.textAlign='center';
+    ctx.fillText(`Inspector is considering${dots}`, W/2, H*0.80);
+  }
+
+  // Verdict: RELEASED (happy ending for demo)
+  if(f>135){
+    const va = Math.min(1,(f-135)/20);
+    ctx.globalAlpha=va;
+    R(16, H*0.76, W-32, 34, 'rgba(0,0,0,0.9)');
+    ctx.strokeStyle='#00ff88'; ctx.lineWidth=2;
+    ctx.strokeRect(16,H*0.76,W-32,34);
+    ctx.fillStyle='#00ff88'; ctx.font='bold 17px monospace'; ctx.textAlign='center';
+    ctx.fillText('✅  LET GO!', W/2, H*0.76+23);
+    ctx.globalAlpha=1;
+  }
+  if(f>155){
+    const ma = Math.min(1,(f-155)/20);
+    ctx.globalAlpha=ma;
+    R(16, H*0.835, W-32, 56, '#050520');
+    ctx.strokeStyle='#cc44ff88'; ctx.lineWidth=1;
+    ctx.strokeRect(16,H*0.835,W-32,56);
+    ctx.fillStyle='#cc44ff'; ctx.font='bold 11px monospace'; ctx.textAlign='left';
+    ctx.fillText('INSPECTOR:', 24, H*0.835+16);
+    ctx.fillStyle='#ddaaff'; ctx.font='12px monospace';
+    ctx.fillText("App crashes happen. Off you go,", 24, H*0.835+32);
+    ctx.fillText("but tap on next time!", 24, H*0.835+46);
+    ctx.globalAlpha=1;
+  }
+
+  if(f<20){ ctx.fillStyle=`rgba(0,0,0,${1-f/20})`; ctx.fillRect(0,0,W,H); }
+  // End fade
+  if(f>160){ ctx.fillStyle=`rgba(0,0,0,${(f-160)/20})`; ctx.fillRect(0,0,W,H); }
+}
+
+// ── CHARACTER DRAW HELPERS (simplified from game) ──
+function drawStudent(px,py,dir,ft,moving){
+  const x=Math.round(px-TILE/2), y=Math.round(py-TILE/2), S=TILE;
+  const f2=moving?Math.floor(ft/7)%2:0;
+  ctx.fillStyle='rgba(0,0,0,0.18)'; ctx.beginPath();
+  ctx.ellipse(px,py+S*0.42,S*0.2,S*0.07,0,0,Math.PI*2); ctx.fill();
+  R(x+S*0.28,y+S*0.62,5,7+(f2?3:-1),'#2244aa'); R(x+S*0.52,y+S*0.62,5,7+(f2?-1:3),'#2244aa');
+  R(x+S*0.25,y+S*0.62+6+(f2?3:-1),7,3,'#111'); R(x+S*0.49,y+S*0.62+6+(f2?-1:3),7,3,'#111');
+  const bagX=dir>0?x+S*0.6:x+S*0.12;
+  R(bagX,y+S*0.32,S*0.18,S*0.22,'#aa8833');
+  R(x+S*0.22,y+S*0.36,S*0.56,S*0.28,'#3a60cc');
+  R(x+S*0.22,y+S*0.36,S*0.56,4,'rgba(255,255,255,0.25)');
+  R(x+S*0.28,y+S*0.12,S*0.44,S*0.25,'#f5c07a');
+  R(x+S*0.28,y+S*0.12,S*0.44,3,'#c09060');
+  if(dir>0){ R(x+S*0.28,y+S*0.08,S*0.44,9,'#1a3a8a'); }
+  else{ R(x+S*0.28,y+S*0.08,S*0.44,9,'#2244cc'); }
+}
+
+function drawInspector(px,py,ft,excl){
+  const x=Math.round(px-TILE/2), y=Math.round(py-TILE/2), S=TILE;
+  const f2=Math.floor(ft/7)%2;
+  if(excl<0){
+    const blink=Math.floor(Date.now()/120)%2;
+    if(blink){ ctx.fillStyle='#ffe800'; ctx.font='bold 13px monospace'; ctx.textAlign='center'; ctx.fillText('?',px,y-4); }
+  } else if(excl>0){
+    const blink=Math.floor(Date.now()/80)%2;
+    if(blink){ ctx.fillStyle='#ff0000'; ctx.font='bold 14px monospace'; ctx.textAlign='center'; ctx.fillText(excl>60?'!!!':excl>30?'!!':'!',px,y-5); }
+  }
+  ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.beginPath();
+  ctx.ellipse(px,py+S*0.42,S*0.22,S*0.08,0,0,Math.PI*2); ctx.fill();
+  R(x+S*0.28,y+S*0.62,5,7+(f2?3:-1),'#1a1a3a'); R(x+S*0.52,y+S*0.62,5,7+(f2?-1:3),'#1a1a3a');
+  R(x+S*0.25,y+S*0.62+6+(f2?3:-1),7,3,'#111'); R(x+S*0.49,y+S*0.62+6+(f2?-1:3),7,3,'#111');
+  R(x+S*0.18,y+S*0.36,S*0.64,S*0.28,'#cc5500');
+  R(x+S*0.18,y+S*0.36,S*0.64,4,'#dd6610');
+  R(x+S*0.18,y+S*0.44,S*0.64,3,'#ffe800'); R(x+S*0.18,y+S*0.55,S*0.64,3,'#ffe800');
+  R(x+S*0.25,y+S*0.12,S*0.5,S*0.25,'#f5c58a');
+  R(x+S*0.2,y+S*0.05,S*0.6,7,'#1a1a5a'); R(x+S*0.14,y+S*0.12,S*0.72,4,'#1a1a5a');
+  R(x+S*0.35,y+S*0.07,S*0.3,4,'#c8a020');
+  ctx.fillStyle='#000'; ctx.font='9px monospace'; ctx.textAlign='center';
+  ctx.fillText('INSPECTOR',px,y+S*0.52);
+}
+
+function drawNPC(npc){
+  const px=npc.c*TILE+TILE/2, py=npc.r*TILE+TILE/2;
+  const x=Math.round(px-TILE/2), y=Math.round(py-TILE/2), S=TILE;
+  ctx.fillStyle='rgba(0,0,0,0.18)'; ctx.beginPath();
+  ctx.ellipse(px,py+S*0.42,S*0.2,S*0.07,0,0,Math.PI*2); ctx.fill();
+  R(x+S*0.22,y+S*0.36,S*0.56,S*0.28,npc.col);
+  R(x+S*0.28,y+S*0.12,S*0.44,S*0.24,'#f0c080');
+  R(x+S*0.28,y+S*0.62,4,7,'#555'); R(x+S*0.52,y+S*0.62,4,7,'#555');
+}
+
+// ── MAIN LOOP ──
+let lastT = 0;
+function loop(t){
+  const dt = t - lastT;
+  if(dt >= 16.67){ // ~60fps cap
+    lastT = t;
+    ctx.clearRect(0,0,W,H);
+
+    // Find current scene
+    let frameInCycle = globalFrame % SCENES.reduce((a,s)=>a+s.dur,0);
+    let accum = 0;
+    for(const scene of SCENES){
+      if(frameInCycle < accum + scene.dur){
+        scene.draw(frameInCycle - accum);
+        break;
+      }
+      accum += scene.dur;
+    }
+    globalFrame++;
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
